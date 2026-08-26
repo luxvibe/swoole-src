@@ -179,9 +179,6 @@ const zend_function_entry swoole_functions[] = {
     PHP_FE(swoole_substr_unserialize, arginfo_swoole_substr_unserialize)
     PHP_FE(swoole_substr_json_decode, arginfo_swoole_substr_json_decode)
     PHP_FE(swoole_internal_call_user_shutdown_begin, arginfo_swoole_internal_call_user_shutdown_begin)
-#ifdef _WIN32
-    PHP_FE(swoole_event_rshutdown,    arginfo_swoole_event_rshutdown)
-#endif
     // for test
     PHP_FE(swoole_implicit_fn,           arginfo_swoole_implicit_fn)
     // for admin server
@@ -225,6 +222,7 @@ const zend_function_entry swoole_functions[] = {
 	ZEND_FE(ssh2_disconnect, arginfo_ssh2_disconnect)
 	ZEND_FE(ssh2_methods_negotiated, arginfo_ssh2_methods_negotiated)
 	ZEND_FE(ssh2_fingerprint, arginfo_ssh2_fingerprint)
+	ZEND_FE(ssh2_hostkey, arginfo_ssh2_hostkey)
 	ZEND_FE(ssh2_auth_none, arginfo_ssh2_auth_none)
 	ZEND_FE(ssh2_auth_password, arginfo_ssh2_auth_password)
 	ZEND_FE(ssh2_auth_pubkey_file, arginfo_ssh2_auth_pubkey_file)
@@ -376,6 +374,10 @@ PHP_INI_END()
 // clang-format on
 
 static void php_swoole_init_globals(zend_swoole_globals *swoole_globals) {
+    #if defined(COMPILE_DL_SWOOLE) && defined(ZTS)
+	ZEND_TSRMLS_CACHE_UPDATE();
+    #endif
+
     swoole_globals->enable_library = true;
     swoole_globals->enable_fiber_mock = false;
     swoole_globals->enable_preemptive_scheduler = false;
@@ -387,6 +389,7 @@ static void php_swoole_init_globals(zend_swoole_globals *swoole_globals) {
     swoole_globals->blocking_threshold = 100000;
     swoole_globals->profile = false;
     swoole_globals->leak_detection = false;
+    swoole_globals->cli = false;
 
     if (strcmp("cli", sapi_module.name) == 0 || strcmp("phpdbg", sapi_module.name) == 0 ||
         strcmp("embed", sapi_module.name) == 0 || strcmp("micro", sapi_module.name) == 0) {
@@ -416,6 +419,16 @@ void php_swoole_register_shutdown_function(const char *function) {
         &function_name, 0, &shutdown_function_entry.fci, &shutdown_function_entry.fci_cache, nullptr, nullptr);
     register_user_shutdown_function(Z_STRVAL(function_name), Z_STRLEN(function_name), &shutdown_function_entry);
 #endif
+}
+
+static bool php_swoole_parse_nonnegative_size(zval *zv, const char *name, zend_long *value) {
+    zend_long size = php_swoole_parse_to_size(zv);
+    if (size < 0) {
+        php_swoole_fatal_error(E_WARNING, "%s must be greater than or equal to 0, got " ZEND_LONG_FMT, name, size);
+        return false;
+    }
+    *value = size;
+    return true;
 }
 
 void php_swoole_set_global_option(HashTable *vht) {
@@ -497,7 +510,10 @@ void php_swoole_set_global_option(HashTable *vht) {
         Socket::default_read_timeout = timeout_format(ztmp);
     }
     if (php_swoole_array_get_value(vht, "socket_buffer_size", ztmp)) {
-        Socket::default_buffer_size = php_swoole_parse_to_size(ztmp);
+        zend_long v;
+        if (php_swoole_parse_nonnegative_size(ztmp, "socket_buffer_size", &v)) {
+            Socket::default_buffer_size = SW_MIN(v, UINT32_MAX);
+        }
     }
     if (php_swoole_array_get_value(vht, "socket_timeout", ztmp)) {
         Socket::default_read_timeout = Socket::default_write_timeout = timeout_format(ztmp);
@@ -505,22 +521,50 @@ void php_swoole_set_global_option(HashTable *vht) {
     // [HTTP2]
     // ======================================================================
     if (php_swoole_array_get_value(vht, "http2_header_table_size", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTING_HEADER_TABLE_SIZE, php_swoole_parse_to_size(ztmp));
+        zend_long v;
+        if (php_swoole_parse_nonnegative_size(ztmp, "http2_header_table_size", &v)) {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTING_HEADER_TABLE_SIZE, SW_MIN(v, UINT32_MAX));
+        }
     }
     if (php_swoole_array_get_value(vht, "http2_enable_push", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_ENABLE_PUSH, zval_get_long(ztmp));
+        zend_long v = zval_get_long(ztmp);
+        if (v < 0) {
+            php_swoole_fatal_error(
+                E_WARNING, "http2_enable_push must be greater than or equal to 0, got " ZEND_LONG_FMT, v);
+        } else {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_ENABLE_PUSH, SW_MIN(v, UINT32_MAX));
+        }
     }
     if (php_swoole_array_get_value(vht, "http2_max_concurrent_streams", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, zval_get_long(ztmp));
+        zend_long v = zval_get_long(ztmp);
+        if (v < 0) {
+            php_swoole_fatal_error(
+                E_WARNING, "http2_max_concurrent_streams must be greater than or equal to 0, got " ZEND_LONG_FMT, v);
+        } else {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, SW_MIN(v, UINT32_MAX));
+        }
     }
     if (php_swoole_array_get_value(vht, "http2_init_window_size", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_INIT_WINDOW_SIZE, php_swoole_parse_to_size(ztmp));
+        zend_long v;
+        if (php_swoole_parse_nonnegative_size(ztmp, "http2_init_window_size", &v)) {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_INIT_WINDOW_SIZE, SW_MIN(v, UINT32_MAX));
+        }
     }
     if (php_swoole_array_get_value(vht, "http2_max_frame_size", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_FRAME_SIZE, php_swoole_parse_to_size(ztmp));
+        zend_long v;
+        if (php_swoole_parse_nonnegative_size(ztmp, "http2_max_frame_size", &v)) {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_FRAME_SIZE, SW_MIN(v, UINT32_MAX));
+        }
     }
     if (php_swoole_array_get_value(vht, "http2_max_header_list_size", ztmp)) {
-        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, php_swoole_parse_to_size(ztmp));
+        zend_long v;
+        if (php_swoole_parse_nonnegative_size(ztmp, "http2_max_header_list_size", &v)) {
+            swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, SW_MIN(v, UINT32_MAX));
+        }
+    }
+    if (php_swoole_array_get_value(vht, "http2_max_headers", ztmp)) {
+        zend_long v = zval_get_long(ztmp);
+        swoole::http2::set_http2_max_headers(SW_MIN(v, UINT32_MAX));
     }
 }
 
@@ -747,10 +791,8 @@ PHP_MINIT_FUNCTION(swoole) {
     /**
      * Register event constants
      */
-#ifndef _WIN32
     SW_REGISTER_LONG_CONSTANT("SWOOLE_EVENT_READ", SW_EVENT_READ);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_EVENT_WRITE", SW_EVENT_WRITE);
-#endif
 
     /**
      * Register ERROR types
@@ -998,9 +1040,7 @@ PHP_MINIT_FUNCTION(swoole) {
         swoole_error, "Swoole\\Error", nullptr, nullptr, zend_ce_error, zend_get_std_object_handlers());
 
     /** <Sort by dependency> **/
-#ifndef _WIN32
     php_swoole_event_minit(module_number);
-#endif
     // base
 #ifndef _WIN32
     php_swoole_atomic_minit(module_number);

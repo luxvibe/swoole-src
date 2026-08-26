@@ -72,12 +72,16 @@ static sw_inline ThreadLockObject *thread_lock_fetch_object(zend_object *obj) {
 }
 
 static Lock *thread_lock_get_ptr(const zval *zobject) {
-    return thread_lock_fetch_object(Z_OBJ_P(zobject))->lock->lock_;
+    ThreadLockResource *lock = thread_lock_fetch_object(Z_OBJ_P(zobject))->lock;
+    if (UNEXPECTED(!lock)) {
+        php_swoole_fatal_error(E_ERROR, "must call constructor first");
+    }
+    return lock->lock_;
 }
 
 static Lock *thread_lock_get_and_check_ptr(const zval *zobject) {
     Lock *lock = thread_lock_get_ptr(zobject);
-    if (!lock) {
+    if (UNEXPECTED(!lock)) {
         php_swoole_fatal_error(E_ERROR, "must call constructor first");
     }
     return lock;
@@ -101,7 +105,11 @@ static zend_object *thread_lock_create_object(zend_class_entry *ce) {
 }
 
 ThreadResource *php_swoole_thread_lock_cast(const zval *zobject) {
-    return thread_lock_fetch_object(Z_OBJ_P(zobject))->lock;
+    ThreadLockResource *lock = thread_lock_fetch_object(Z_OBJ_P(zobject))->lock;
+    if (UNEXPECTED(!lock)) {
+        php_swoole_fatal_error(E_ERROR, "must call constructor first");
+    }
+    return lock;
 }
 
 void php_swoole_thread_lock_create(zval *return_value, ThreadResource *resource) {
@@ -146,18 +154,19 @@ void php_swoole_thread_lock_minit(int module_number) {
 }
 
 static PHP_METHOD(swoole_thread_lock, __construct) {
-    auto o = thread_lock_fetch_object(Z_OBJ_P(ZEND_THIS));
-    if (o->lock != nullptr) {
-        zend_throw_error(nullptr, "Constructor of %s can only be called once", SW_Z_OBJCE_NAME_VAL_P(ZEND_THIS));
-        RETURN_FALSE;
-    }
-
     zend_long type = Lock::MUTEX;
 
     ZEND_PARSE_PARAMETERS_START(0, 1)
     Z_PARAM_OPTIONAL
     Z_PARAM_LONG(type)
     ZEND_PARSE_PARAMETERS_END();
+
+    // Parameter parsing can run user code, so inspect native state only after it.
+    auto o = thread_lock_fetch_object(Z_OBJ_P(ZEND_THIS));
+    if (o->lock != nullptr) {
+        zend_throw_error(nullptr, "Constructor of %s can only be called once", SW_Z_OBJCE_NAME_VAL_P(ZEND_THIS));
+        RETURN_FALSE;
+    }
 
     o->lock = new ThreadLockResource(type);
 }

@@ -36,36 +36,98 @@ void *php_ssh2_zval_from_resource_handle(int handle) {
  * channel_stream_ops *
  ********************** */
 
+/* Raw single-attempt libssh2 calls. Parenthesizing the name bypasses the
+ * coroutine-hook function-like macros in php_swoole_ssh2_hook.h, so these surface
+ * LIBSSH2_ERROR_EAGAIN to the caller instead of polling/yielding until data. */
+static inline ssize_t php_ssh2_channel_read_raw(LIBSSH2_CHANNEL *channel, int streamid, char *buf, size_t count) {
+    return (libssh2_channel_read_ex)(channel, streamid, buf, count);
+}
+
+static inline ssize_t php_ssh2_channel_write_raw(LIBSSH2_CHANNEL *channel,
+                                                 int streamid,
+                                                 const char *buf,
+                                                 size_t count) {
+    return (libssh2_channel_write_ex)(channel, streamid, buf, count);
+}
+
+static inline int php_ssh2_channel_eof_raw(LIBSSH2_CHANNEL *channel) {
+    return (libssh2_channel_eof)(channel);
+}
+
+enum php_ssh2_channel_completion_state {
+    PHP_SSH2_CHANNEL_COMPLETION_COMPLETE,
+    PHP_SSH2_CHANNEL_COMPLETION_INCOMPLETE,
+    PHP_SSH2_CHANNEL_COMPLETION_ERROR,
+};
+
+static php_ssh2_channel_completion_state php_ssh2_channel_complete(php_ssh2_channel_data *abstract, bool may_block) {
+    if (!php_ssh2_channel_eof_raw(abstract->channel)) {
+        return PHP_SSH2_CHANNEL_COMPLETION_INCOMPLETE;
+    }
+    if (!abstract->wait_for_remote_close) {
+        return PHP_SSH2_CHANNEL_COMPLETION_COMPLETE;
+    }
+
+    int state;
+    if (may_block) {
+        auto session = ssh2_get_session(abstract);
+#ifdef PHP_SSH2_SESSION_TIMEOUT
+        const double timeout = abstract->timeout / 1000.0;
+#else
+        const double timeout = 0;
+#endif
+        state = ssh2_async_call(session,
+                                [&]() { return libssh2_channel_wait_closed(abstract->channel); },
+                                timeout,
+                                &abstract->timeout_event);
+    } else {
+        state = libssh2_channel_wait_closed(abstract->channel);
+    }
+
+    if (state == 0) {
+        return PHP_SSH2_CHANNEL_COMPLETION_COMPLETE;
+    }
+    if (state == LIBSSH2_ERROR_EAGAIN) {
+        return PHP_SSH2_CHANNEL_COMPLETION_INCOMPLETE;
+    }
+    return PHP_SSH2_CHANNEL_COMPLETION_ERROR;
+}
+
 static ssize_t php_ssh2_channel_stream_write(php_stream *stream, const char *buf, size_t count) {
     php_ssh2_channel_data *abstract = (php_ssh2_channel_data *) stream->abstract;
     ssize_t writestate;
-    LIBSSH2_SESSION *session;
 
-    session =
+    abstract->timeout_event = false;
+
+    if (!php_ssh2_session_is_open(abstract->session_rsrc)) {
+        return -1;
+    }
+
+    if (!abstract->is_blocking) {
+        writestate = php_ssh2_channel_write_raw(abstract->channel, abstract->streamid, buf, count);
+        if (writestate == LIBSSH2_ERROR_EAGAIN) {
+            return 0;
+        }
+        return writestate;
+    }
+
+    auto session =
         (LIBSSH2_SESSION *) zend_fetch_resource(abstract->session_rsrc, PHP_SSH2_SESSION_RES_NAME, le_ssh2_session);
 
 #ifdef PHP_SSH2_SESSION_TIMEOUT
-    if (abstract->is_blocking) {
-        ssh2_set_socket_timeout(session, abstract->timeout);
-    }
+    const double timeout = abstract->timeout / 1000.0;
+#else
+    const double timeout = 0;
 #endif
 
-    writestate = libssh2_channel_write_ex(abstract->channel, abstract->streamid, buf, count);
-
-#ifdef PHP_SSH2_SESSION_TIMEOUT
-    if (abstract->is_blocking) {
-        ssh2_set_socket_timeout(session, -1);
-    }
-#endif
-
-    if (writestate < 0) {
-        char *error_msg = NULL;
-        if (libssh2_session_last_error(session, &error_msg, NULL, 0) == writestate) {
-            php_error_docref(NULL, E_WARNING, "Failure '%s' (%ld)", error_msg, writestate);
-        }
-
-        stream->eof = 1;
-    }
+    // Channel timeouts are stream-local; pass them to the poll instead of mutating the shared session socket.
+    writestate = ssh2_async_call(session,
+                                 [&]() {
+                                     return (libssh2_channel_write_ex)(
+                                         abstract->channel, abstract->streamid, buf, count);
+                                 },
+                                 timeout,
+                                 &abstract->timeout_event);
 
     return writestate;
 }
@@ -73,33 +135,58 @@ static ssize_t php_ssh2_channel_stream_write(php_stream *stream, const char *buf
 static ssize_t php_ssh2_channel_stream_read(php_stream *stream, char *buf, size_t count) {
     php_ssh2_channel_data *abstract = (php_ssh2_channel_data *) stream->abstract;
     ssize_t readstate;
+
+    abstract->timeout_event = false;
+
+    if (!php_ssh2_session_is_open(abstract->session_rsrc)) {
+        stream->eof = 1;
+        return -1;
+    }
+
+    if (!abstract->is_blocking) {
+        readstate = php_ssh2_channel_read_raw(abstract->channel, abstract->streamid, buf, count);
+        if (readstate == LIBSSH2_ERROR_EAGAIN) {
+            stream->eof = 0;
+            return 0;
+        }
+        if (readstate == 0) {
+            auto completion = php_ssh2_channel_complete(abstract, false);
+            if (completion == PHP_SSH2_CHANNEL_COMPLETION_ERROR) {
+                /* Reads report the error; liveness publishes the terminal state. */
+                return -1;
+            }
+            stream->eof = completion == PHP_SSH2_CHANNEL_COMPLETION_COMPLETE;
+            return 0;
+        }
+        return readstate;
+    }
+
     auto session = ssh2_get_session(abstract);
 
-    stream->eof = libssh2_channel_eof(abstract->channel);
-
 #ifdef PHP_SSH2_SESSION_TIMEOUT
-    if (abstract->is_blocking) {
-        ssh2_set_socket_timeout(session, abstract->timeout);
-    }
+    const double timeout = abstract->timeout / 1000.0;
+#else
+    const double timeout = 0;
 #endif
 
-    readstate = libssh2_channel_read_ex(abstract->channel, abstract->streamid, buf, count);
+    // Channel timeouts are stream-local; pass them to the poll instead of mutating the shared session socket.
+    readstate = ssh2_async_call(session,
+                                [&]() {
+                                    return (libssh2_channel_read_ex)(
+                                        abstract->channel, abstract->streamid, buf, count);
+                                },
+                                timeout,
+                                &abstract->timeout_event);
 
-#ifdef PHP_SSH2_SESSION_TIMEOUT
-    if (abstract->is_blocking) {
-        ssh2_set_socket_timeout(session, -1);
-    }
-#endif
-
-    if (readstate < 0) {
-        char *error_msg = NULL;
-        if (libssh2_session_last_error(session, &error_msg, NULL, 0) == readstate) {
-            php_error_docref(NULL, E_WARNING, "Failure '%s' (%ld)", error_msg, readstate);
+    if (readstate == 0) {
+        auto completion = php_ssh2_channel_complete(abstract, true);
+        if (completion == PHP_SSH2_CHANNEL_COMPLETION_ERROR) {
+            /* A completion timeout is retryable and must not be published as EOF. */
+            return -1;
         }
-
-        stream->eof = 1;
-        readstate = 0;
+        stream->eof = completion == PHP_SSH2_CHANNEL_COMPLETION_COMPLETE;
     }
+
     return readstate;
 }
 
@@ -111,9 +198,10 @@ static int php_ssh2_channel_stream_close(php_stream *stream, int close_handle) {
         if (abstract->refcount) {
             efree(abstract->refcount);
         }
-        auto session = ssh2_get_session(abstract);
-        libssh2_channel_eof(abstract->channel);
-        libssh2_channel_free(abstract->channel);
+        if (php_ssh2_session_is_open(abstract->session_rsrc)) {
+            libssh2_channel_free(abstract->channel);
+        }
+
         zend_list_delete(abstract->session_rsrc);
     }
     efree(abstract);
@@ -123,6 +211,11 @@ static int php_ssh2_channel_stream_close(php_stream *stream, int close_handle) {
 
 static int php_ssh2_channel_stream_flush(php_stream *stream) {
     php_ssh2_channel_data *abstract = (php_ssh2_channel_data *) stream->abstract;
+
+    if (!php_ssh2_session_is_open(abstract->session_rsrc)) {
+        return -1;
+    }
+
     auto session = ssh2_get_session(abstract);
 
     return libssh2_channel_flush_ex(abstract->channel, abstract->streamid);
@@ -132,6 +225,10 @@ static int php_ssh2_channel_stream_cast(php_stream *stream, int castas, void **r
     php_ssh2_channel_data *abstract = (php_ssh2_channel_data *) stream->abstract;
     LIBSSH2_SESSION *session;
     php_ssh2_session_data **session_data;
+
+    if (!php_ssh2_session_is_open(abstract->session_rsrc)) {
+        return FAILURE;
+    }
 
     session =
         (LIBSSH2_SESSION *) zend_fetch_resource(abstract->session_rsrc, PHP_SSH2_SESSION_RES_NAME, le_ssh2_session);
@@ -152,7 +249,6 @@ static int php_ssh2_channel_stream_cast(php_stream *stream, int castas, void **r
 
 static int php_ssh2_channel_stream_set_option(php_stream *stream, int option, int value, void *ptrparam) {
     php_ssh2_channel_data *abstract = (php_ssh2_channel_data *) stream->abstract;
-    auto session = ssh2_get_session(abstract);
     int ret;
 
     switch (option) {
@@ -162,25 +258,54 @@ static int php_ssh2_channel_stream_set_option(php_stream *stream, int option, in
         return ret;
     }
     case PHP_STREAM_OPTION_META_DATA_API: {
-        add_assoc_long((zval *) ptrparam, "exit_status", libssh2_channel_get_exit_status(abstract->channel));
-        break;
+        add_assoc_bool((zval *) ptrparam, "timed_out", abstract->timeout_event);
+        add_assoc_bool((zval *) ptrparam, "blocked", abstract->is_blocking);
+        add_assoc_bool((zval *) ptrparam, "eof", stream->eof);
+
+        if (php_ssh2_session_is_open(abstract->session_rsrc)) {
+            auto session = ssh2_get_session(abstract);
+            char *exit_signal = NULL;
+            size_t exit_signal_len = 0;
+
+            /* A signalled command may have no exit-status, leaving libssh2's status at 0. */
+            add_assoc_long((zval *) ptrparam, "exit_status", libssh2_channel_get_exit_status(abstract->channel));
+            if (libssh2_channel_get_exit_signal(
+                    abstract->channel, &exit_signal, &exit_signal_len, NULL, NULL, NULL, NULL) == 0 &&
+                exit_signal) {
+                add_assoc_stringl((zval *) ptrparam, "exit_signal", exit_signal, exit_signal_len);
+                libssh2_free(session, exit_signal);
+            } else {
+                add_assoc_null((zval *) ptrparam, "exit_signal");
+            }
+        }
+
+        return PHP_STREAM_OPTION_RETURN_OK;
     }
     case PHP_STREAM_OPTION_READ_TIMEOUT: {
-        ret = abstract->timeout;
 #ifdef PHP_SSH2_SESSION_TIMEOUT
         struct timeval tv = *(struct timeval *) ptrparam;
         abstract->timeout = tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+        abstract->timeout_event = false;
+        return PHP_STREAM_OPTION_RETURN_OK;
 #else
         php_error_docref(NULL, E_WARNING, "No support for ssh2 stream timeout. Please recompile with libssh2 >= 1.2.9");
+        return PHP_STREAM_OPTION_RETURN_ERR;
 #endif
-        return ret;
     }
     case PHP_STREAM_OPTION_CHECK_LIVENESS: {
-        return stream->eof = libssh2_channel_eof(abstract->channel);
+        if (!php_ssh2_session_is_open(abstract->session_rsrc)) {
+            stream->eof = 1;
+            return PHP_STREAM_OPTION_RETURN_ERR;
+        }
+
+        auto completion = php_ssh2_channel_complete(abstract, false);
+        stream->eof = completion != PHP_SSH2_CHANNEL_COMPLETION_INCOMPLETE;
+        /* This check never blocks, so a completion error means the stream is dead. */
+        return stream->eof ? PHP_STREAM_OPTION_RETURN_ERR : PHP_STREAM_OPTION_RETURN_OK;
     }
     }
 
-    return -1;
+    return PHP_STREAM_OPTION_RETURN_NOTIMPL;
 }
 
 php_stream_ops php_ssh2_channel_stream_ops = {
@@ -268,6 +393,11 @@ php_url *php_ssh2_fopen_wraper_parse_path(const char *path,
             /* suppress potential warning by passing NULL as resource_type_name */
             sftp_data = (php_ssh2_sftp_data *) zend_fetch_resource(Z_RES_P(zresource), NULL, le_ssh2_sftp);
             if (sftp_data) {
+                if (!php_ssh2_session_is_open(sftp_data->session_rsrc)) {
+                    php_url_free(resource);
+                    return NULL;
+                }
+
                 /* Want the sftp layer */
                 Z_ADDREF_P(zresource);
                 *psftp_rsrc = Z_RES_P(zresource);
@@ -313,6 +443,11 @@ php_url *php_ssh2_fopen_wraper_parse_path(const char *path,
         php_ssh2_sftp_data *sftp_data;
         sftp_data = (php_ssh2_sftp_data *) zend_fetch_resource(Z_RES_P(tmpzval), PHP_SSH2_SFTP_RES_NAME, le_ssh2_sftp);
         if (sftp_data) {
+            if (!php_ssh2_session_is_open(sftp_data->session_rsrc)) {
+                php_url_free(resource);
+                return NULL;
+            }
+
             Z_ADDREF_P(tmpzval);
             *psftp_rsrc = Z_RES_P(tmpzval);
             *psftp = sftp_data->sftp;
@@ -414,6 +549,12 @@ php_url *php_ssh2_fopen_wraper_parse_path(const char *path,
         return NULL;
     }
 
+    if (pubkey_file && privkey_file &&
+        (php_check_open_basedir(pubkey_file) || php_check_open_basedir(privkey_file))) {
+        php_url_free(resource);
+        return NULL;
+    }
+
     session = php_ssh2_session_connect(ZSTR_VAL(resource->host), resource->port, methods, callbacks);
     if (!session) {
         /* Unable to connect! */
@@ -421,13 +562,10 @@ php_url *php_ssh2_fopen_wraper_parse_path(const char *path,
         return NULL;
     }
 
+    ZVAL_RES(&zsession, zend_register_resource(session, le_ssh2_session));
+
     /* Authenticate */
     if (pubkey_file && privkey_file) {
-        if (php_check_open_basedir(pubkey_file) || php_check_open_basedir(privkey_file)) {
-            php_url_free(resource);
-            return NULL;
-        }
-
         /* Attempt pubkey authentication */
         if (!libssh2_userauth_publickey_fromfile(session, username, pubkey_file, privkey_file, password)) {
             goto session_authed;
@@ -443,17 +581,12 @@ php_url *php_ssh2_fopen_wraper_parse_path(const char *path,
 
     /* Auth failure */
     php_url_free(resource);
-    if (Z_RES(zsession)) {
-        zend_list_delete(Z_RES(zsession));
-    }
+    zend_list_delete(Z_RES(zsession));
     return NULL;
 
 session_authed:
-    ZVAL_RES(&zsession, zend_register_resource(session, le_ssh2_session));
-
-    if (psftp) {
+    if (psftp && psftp_rsrc) {
         LIBSSH2_SFTP *sftp;
-        zval zsftp{};
 
         sftp = libssh2_sftp_init(session);
         if (!sftp) {
@@ -466,10 +599,7 @@ session_authed:
         sftp_data->session = session;
         sftp_data->sftp = sftp;
         sftp_data->session_rsrc = Z_RES(zsession);
-
-        // TODO Sean-Der
-        // ZEND_REGISTER_RESOURCE(sftp_data, le_ssh2_sftp);
-        *psftp_rsrc = Z_RES(zsftp);
+        *psftp_rsrc = zend_register_resource(sftp_data, le_ssh2_sftp);
         *psftp = sftp;
     }
 
@@ -507,31 +637,24 @@ static php_stream *php_ssh2_shell_open(LIBSSH2_SESSION *session,
 
     if (environment) {
         zend_string *key;
-        int key_type;
-        zend_ulong idx;
+        zval *value;
 
-        for (zend_hash_internal_pointer_reset(HASH_OF(environment));
-             (key_type = zend_hash_get_current_key(HASH_OF(environment), &key, &idx)) != HASH_KEY_NON_EXISTENT;
-             zend_hash_move_forward(HASH_OF(environment))) {
-            if (key_type == HASH_KEY_IS_STRING) {
-                zval *value;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(environment), key, value) {
+            if (key) {
+                zval copyval = *value;
 
-                if ((value = zend_hash_get_current_data(HASH_OF(environment))) != NULL) {
-                    zval copyval = *value;
+                zval_copy_ctor(&copyval);
+                convert_to_string(&copyval);
 
-                    zval_copy_ctor(&copyval);
-                    convert_to_string(&copyval);
-
-                    if (libssh2_channel_setenv_ex(channel, key->val, key->len, Z_STRVAL(copyval), Z_STRLEN(copyval))) {
-                        php_error_docref(
-                            NULL, E_WARNING, "Failed setting %s=%s on remote end", ZSTR_VAL(key), Z_STRVAL(copyval));
-                    }
-                    zval_dtor(&copyval);
+                if (libssh2_channel_setenv_ex(channel, key->val, key->len, Z_STRVAL(copyval), Z_STRLEN(copyval))) {
+                    php_error_docref(
+                        NULL, E_WARNING, "Failed setting environment variable %s on remote end", ZSTR_VAL(key));
                 }
+                zval_dtor(&copyval);
             } else {
                 php_error_docref(NULL, E_NOTICE, "Skipping numeric index in environment array");
             }
-        }
+        } ZEND_HASH_FOREACH_END();
     }
 
     if (type == PHP_SSH2_TERM_UNIT_CHARS) {
@@ -555,13 +678,7 @@ static php_stream *php_ssh2_shell_open(LIBSSH2_SESSION *session,
     }
 
     /* Turn it into a stream */
-    channel_data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
-    channel_data->channel = channel;
-    channel_data->streamid = 0;
-    channel_data->is_blocking = 0;
-    channel_data->timeout = 0;
-    channel_data->session_rsrc = resource;
-    channel_data->refcount = NULL;
+    channel_data = php_ssh2_channel_data_create(channel, resource, false);
 
     stream = php_stream_alloc(&php_ssh2_channel_stream_ops, channel_data, 0, "r+");
 
@@ -695,8 +812,8 @@ PHP_FUNCTION(ssh2_shell) {
     zend_long type = PHP_SSH2_DEFAULT_TERM_UNIT;
     int argc = ZEND_NUM_ARGS();
 
-    if (argc == 5) {
-        php_error_docref(NULL, E_ERROR, "width specified without height parameter");
+    if (argc == 4) {
+        php_error_docref(NULL, E_WARNING, "width specified without height parameter");
         RETURN_FALSE;
     }
 
@@ -742,6 +859,11 @@ PHP_FUNCTION(ssh2_shell_resize) {
     }
 
     data = (php_ssh2_channel_data *) parent->abstract;
+
+    if (!php_ssh2_session_is_open(data->session_rsrc)) {
+        RETURN_FALSE;
+    }
+
     auto session = ssh2_get_session(data);
 
     libssh2_channel_request_pty_size_ex(data->channel, width, height, width_px, height_px);
@@ -776,32 +898,24 @@ static php_stream *php_ssh2_exec_command(LIBSSH2_SESSION *session,
     }
 
     if (environment) {
-        zend_string *key = NULL;
-        int key_type;
-        zend_ulong idx = 0;
-        HashPosition pos;
+        zend_string *key;
+        zval *value;
 
-        for (zend_hash_internal_pointer_reset_ex(HASH_OF(environment), &pos);
-             (key_type = zend_hash_get_current_key_ex(HASH_OF(environment), &key, &idx, &pos)) != HASH_KEY_NON_EXISTENT;
-             zend_hash_move_forward_ex(HASH_OF(environment), &pos)) {
-            if (key_type == HASH_KEY_IS_STRING) {
-                zval *value;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(environment), key, value) {
+            if (key) {
+                zval copyval = *value;
 
-                if ((value = zend_hash_get_current_data(HASH_OF(environment))) != NULL) {
-                    zval copyval = *value;
-
-                    zval_copy_ctor(&copyval);
-                    convert_to_string(&copyval);
-                    if (libssh2_channel_setenv_ex(channel, key->val, key->len, Z_STRVAL(copyval), Z_STRLEN(copyval))) {
-                        php_error_docref(
-                            NULL, E_WARNING, "Failed setting %s=%s on remote end", ZSTR_VAL(key), Z_STRVAL(copyval));
-                    }
-                    zval_dtor(&copyval);
+                zval_copy_ctor(&copyval);
+                convert_to_string(&copyval);
+                if (libssh2_channel_setenv_ex(channel, key->val, key->len, Z_STRVAL(copyval), Z_STRLEN(copyval))) {
+                    php_error_docref(
+                        NULL, E_WARNING, "Failed setting environment variable %s on remote end", ZSTR_VAL(key));
                 }
+                zval_dtor(&copyval);
             } else {
                 php_error_docref(NULL, E_NOTICE, "Skipping numeric index in environment array");
             }
-        }
+        } ZEND_HASH_FOREACH_END();
     }
 
     if (term) {
@@ -828,13 +942,7 @@ static php_stream *php_ssh2_exec_command(LIBSSH2_SESSION *session,
     }
 
     /* Turn it into a stream */
-    channel_data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
-    channel_data->channel = channel;
-    channel_data->streamid = 0;
-    channel_data->is_blocking = 0;
-    channel_data->timeout = 0;
-    channel_data->session_rsrc = rsrc;
-    channel_data->refcount = NULL;
+    channel_data = php_ssh2_channel_data_create(channel, rsrc, true);
 
     stream = php_stream_alloc(&php_ssh2_channel_stream_ops, channel_data, 0, "r+");
 
@@ -1016,13 +1124,7 @@ static php_stream *php_ssh2_scp_xfer(LIBSSH2_SESSION *session, zend_resource *rs
     }
 
     /* Turn it into a stream */
-    channel_data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
-    channel_data->channel = channel;
-    channel_data->streamid = 0;
-    channel_data->is_blocking = 0;
-    channel_data->timeout = 0;
-    channel_data->session_rsrc = rsrc;
-    channel_data->refcount = NULL;
+    channel_data = php_ssh2_channel_data_create(channel, rsrc, false);
 
     stream = php_stream_alloc(&php_ssh2_channel_stream_ops, channel_data, 0, "r");
 
@@ -1265,13 +1367,7 @@ static php_stream *php_ssh2_direct_tcpip(LIBSSH2_SESSION *session, zend_resource
     }
 
     /* Turn it into a stream */
-    channel_data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
-    channel_data->channel = channel;
-    channel_data->streamid = 0;
-    channel_data->is_blocking = 0;
-    channel_data->timeout = 0;
-    channel_data->session_rsrc = rsrc;
-    channel_data->refcount = NULL;
+    channel_data = php_ssh2_channel_data_create(channel, rsrc, false);
 
     stream = php_stream_alloc(&php_ssh2_channel_stream_ops, channel_data, 0, "r+");
 
@@ -1409,6 +1505,10 @@ PHP_FUNCTION(ssh2_fetch_stream) {
 
     data = (php_ssh2_channel_data *) parent->abstract;
 
+    if (!php_ssh2_session_is_open(data->session_rsrc)) {
+        RETURN_FALSE;
+    }
+
     if (!data->refcount) {
         data->refcount = (uchar *) emalloc(sizeof(uchar));
         *(data->refcount) = 1;
@@ -1424,12 +1524,13 @@ PHP_FUNCTION(ssh2_fetch_stream) {
     stream_data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
     memcpy(stream_data, data, sizeof(php_ssh2_channel_data));
     stream_data->streamid = streamid;
+    stream_data->timeout_event = false;
 
     stream = php_stream_alloc(&php_ssh2_channel_stream_ops, stream_data, 0, "r+");
     if (!stream) {
         php_error_docref(NULL, E_WARNING, "Error opening substream");
         efree(stream_data);
-        (data->refcount)--;
+        (*(data->refcount))--;
         RETURN_FALSE;
     }
 
@@ -1459,6 +1560,10 @@ PHP_FUNCTION(ssh2_send_eof) {
     data = (php_ssh2_channel_data *) parent->abstract;
     if (!data) {
         php_error_docref(NULL, E_WARNING, "Abstract in stream is null");
+        RETURN_FALSE;
+    }
+
+    if (!php_ssh2_session_is_open(data->session_rsrc)) {
         RETURN_FALSE;
     }
 

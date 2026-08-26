@@ -4,36 +4,42 @@ on: [push, pull_request]
 jobs:
   windows-tests:
     name: Unit Test on Windows
-    runs-on: windows-latest
+    runs-on: windows-2022
+    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[win-unit]')"
     strategy:
       fail-fast: false
       matrix:
-        os: [ 'windows-latest' ]
+        os: [ 'windows-2022' ]
         ts: [ 'ts' ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Configure git for phpt tests
+        shell: cmd
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - name: Setup PHP
-        uses: shivammathur/setup-php@master
+        uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          # ini-values: pcov.directory=lib
-          # coverage: pcov
           coverage: none
-          extensions: curl,openssl,pdo
+          extensions: curl,openssl,pdo,sockets
         env:
           phpts: ts
 
       - name: Cache PHP deps and devpack
         id: cache-php
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             C:\tools\phpdev\deps
             C:\tools\phpdev\php-*-devel-*-*
-          key: php84-${{ runner.os }}-${{ matrix.ts }}-v2
+          key: php84-${{ runner.os }}-${{ matrix.ts }}-v3
           restore-keys: |
             php84-${{ runner.os }}-${{ matrix.ts }}-
             php84-${{ runner.os }}-
@@ -51,3 +57,19 @@ jobs:
         shell: powershell
         run: |
           php -d extension=php_swoole --ri swoole
+
+      - name: Install test dependencies
+        shell: cmd
+        run: |
+          php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+          php composer-setup.php --quiet
+          php composer.phar install --working-dir=tests\include\lib --no-interaction
+
+      - name: Run unit tests
+        shell: cmd
+        run: |
+          set PHPT=1
+          set TEST_PHP_EXECUTABLE=php
+          set SKIP_ONLINE_TESTS=1
+          set NO_INTERACTION=1
+          php tests\run-tests -P -q -d extension=php_swoole -d swoole.use_shortname=On --show-diff -g FAIL,BORK,LEAK,XLEAK --show-slow 1000 --set-timeout 300 tests\swoole_windows tests\swoole_function

@@ -18,9 +18,32 @@
 #include "swoole_hash.h"
 #include "swoole_util.h"
 
+#include <limits>
 #include <thread>
 
 namespace swoole {
+
+TableValue::TableValue(const TableColumn *_column, const void *value, size_t length) : column(_column) {
+    if (length != 0) {
+        data.assign(static_cast<const char *>(value), length);
+    }
+}
+
+static bool size_mul_overflow(size_t a, size_t b, size_t *result) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return true;
+    }
+    *result = a * b;
+    return false;
+}
+
+static bool size_add_overflow(size_t a, size_t b, size_t *result) {
+    if (b > std::numeric_limits<size_t>::max() - a) {
+        return true;
+    }
+    *result = a + b;
+    return false;
+}
 
 Table *Table::make(uint32_t rows_size, float conflict_proportion) {
     if (rows_size >= SW_TABLE_MAX_ROW_SIZE) {
@@ -60,12 +83,29 @@ Table *Table::make(uint32_t rows_size, float conflict_proportion) {
 }
 
 bool Table::add_column(const std::string &_name, enum TableColumn::Type _type, size_t _size) {
+    if (created) {
+        swoole_warning("unable to add column after table has been created");
+        return false;
+    }
     if (_type < TableColumn::TYPE_INT || _type > TableColumn::TYPE_STRING) {
         swoole_warning("unknown column type");
         return false;
     }
+    if (column_map->find(_name) != column_map->end()) {
+        swoole_warning("column[%s] already exists", _name.c_str());
+        return false;
+    }
+    if (_type == TableColumn::TYPE_STRING && _size > std::numeric_limits<uint32_t>::max() - sizeof(TableStringLength)) {
+        swoole_warning("column[%s] size is too large", _name.c_str());
+        return false;
+    }
 
     auto col = new TableColumn(_name, _type, _size);
+    if (col->size > std::numeric_limits<size_t>::max() - item_size) {
+        delete col;
+        swoole_warning("table row size overflow");
+        return false;
+    }
     col->index = item_size;
     item_size += col->size;
     column_map->emplace(_name, col);
@@ -83,10 +123,12 @@ TableColumn *Table::get_column(const std::string &key) const {
     }
 }
 
-bool Table::exists(const char *key, uint16_t keylen) const {
+bool Table::exists(const char *key, size_t keylen) const {
     TableRow *_rowlock = nullptr;
     const TableRow *row = get(key, keylen, &_rowlock);
-    _rowlock->unlock();
+    if (_rowlock) {
+        _rowlock->unlock();
+    }
     return row != nullptr;
 }
 
@@ -117,27 +159,52 @@ size_t Table::calc_memory_size() const {
     /**
      * table size + conflict size
      */
-    size_t _row_num = size * (1 + conflict_proportion);
+    size_t conflict_row_num = size * conflict_proportion;
+    size_t _row_num = 0;
+    if (size_add_overflow(size, conflict_row_num, &_row_num)) {
+        swoole_warning("table row number overflow");
+        return 0;
+    }
 
     /*
      * header + data
      */
-    size_t _row_memory_size = sizeof(TableRow) + item_size;
+    size_t _row_memory_size = 0;
+    if (size_add_overflow(sizeof(TableRow), item_size, &_row_memory_size)) {
+        swoole_warning("table row memory size overflow");
+        return 0;
+    }
+    _row_memory_size = SW_MEM_ALIGNED_SIZE(_row_memory_size);
 
     /**
      * row data & header
      */
-    size_t _memory_size = _row_num * _row_memory_size;
+    size_t _memory_size = 0;
+    if (size_mul_overflow(_row_num, _row_memory_size, &_memory_size)) {
+        swoole_warning("table memory size overflow");
+        return 0;
+    }
 
     /**
      * memory pool for conflict rows
      */
-    _memory_size += FixedPool::sizeof_struct_impl() + ((_row_num - size) * FixedPool::sizeof_struct_slice());
+    size_t conflict_pool_size = 0;
+    if (size_mul_overflow(_row_num - size, FixedPool::sizeof_struct_slice(), &conflict_pool_size) ||
+        size_add_overflow(conflict_pool_size, FixedPool::sizeof_struct_impl(), &conflict_pool_size) ||
+        size_add_overflow(_memory_size, conflict_pool_size, &_memory_size)) {
+        swoole_warning("table conflict pool memory size overflow");
+        return 0;
+    }
 
     /**
      * for iterator, Iterate through all the elements
      */
-    _memory_size += size * sizeof(TableRow *);
+    size_t rows_index_size = 0;
+    if (size_mul_overflow(size, sizeof(TableRow *), &rows_index_size) ||
+        size_add_overflow(_memory_size, rows_index_size, &_memory_size)) {
+        swoole_warning("table rows index memory size overflow");
+        return 0;
+    }
 
     swoole_trace("_memory_size=%lu, _row_num=%lu, _row_memory_size=%lu", _memory_size, _row_num, _row_memory_size);
 
@@ -165,7 +232,15 @@ bool Table::create() {
     }
 
     size_t _memory_size = calc_memory_size();
-    size_t _row_memory_size = sizeof(TableRow) + item_size;
+    if (_memory_size == 0) {
+        return false;
+    }
+    const size_t _total_memory_size = _memory_size;
+    size_t _row_memory_size = SW_MEM_ALIGNED_SIZE(sizeof(TableRow) + item_size);
+    if (_row_memory_size > std::numeric_limits<uint32_t>::max()) {
+        swoole_warning("table row memory size is too large");
+        return false;
+    }
 
     void *_memory = sw_shm_malloc(_memory_size);
     if (_memory == nullptr) {
@@ -184,9 +259,9 @@ bool Table::create() {
 
     _memory = static_cast<char *>(_memory) + _row_memory_size * size;
     _memory_size -= _row_memory_size * size;
-    pool = new FixedPool(_row_memory_size, _memory, _memory_size, true);
+    pool = new FixedPool(static_cast<uint32_t>(_row_memory_size), _memory, _memory_size, true);
     iterator = new TableIterator(_row_memory_size);
-    memory_size = _memory_size;
+    memory_size = _total_memory_size;
     created = true;
 
     return true;
@@ -307,72 +382,154 @@ void Table::forward() const {
     iterator->unlock();
 }
 
-TableRow *Table::get(const char *key, uint16_t keylen, TableRow **rowlock) const {
-    check_key_length(&keylen);
-
-    TableRow *row = hash(key, keylen);
-
-    *rowlock = row;
-    row->lock();
-
-    for (;;) {
-        if (sw_mem_equal(row->key, row->key_len, key, keylen)) {
-            if (!row->active) {
-                row = nullptr;
-            }
-            break;
-        } else if (row->next == nullptr) {
-            row = nullptr;
-            break;
-        } else {
-            row = row->next;
-        }
+TableRow *Table::find_row(
+    TableRow *root, const char *key, size_t keylen, TableRow **previous, uint32_t *conflict_level) const {
+    *previous = nullptr;
+    if (conflict_level) {
+        *conflict_level = 0;
+    }
+    if (!root->active) {
+        return nullptr;
     }
 
-    return row;
+    TableRow *row = root;
+    uint32_t level = 1;
+    for (;;) {
+        if (sw_mem_equal(row->key, row->key_len, key, keylen)) {
+            if (conflict_level) {
+                *conflict_level = level;
+            }
+            return row;
+        }
+        if (row->next == nullptr) {
+            *previous = row;
+            if (conflict_level) {
+                *conflict_level = level;
+            }
+            return nullptr;
+        }
+        *previous = row;
+        row = row->next;
+        level++;
+    }
 }
 
-TableRow *Table::set(const char *key, uint16_t keylen, TableRow **rowlock, int *out_flags) {
-    check_key_length(&keylen);
-
-    TableRow *row = hash(key, keylen);
-    *rowlock = row;
-    row->lock();
-    int _out_flags = 0;
-
-    if (row->active) {
-        uint32_t _conflict_level = 1;
-        while (!sw_mem_equal(row->key, row->key_len, key, keylen)) {
-            if (row->next == nullptr) {
-                conflict_count++;
-                if (_conflict_level > conflict_max_level) {
-                    conflict_max_level = _conflict_level;
-                }
-                TableRow *new_row = alloc_row();
-                if (!new_row) {
-                    return nullptr;
-                }
-                init_row(new_row, key, keylen);
-                _out_flags |= SW_TABLE_FLAG_NEW_ROW;
-                row->next = new_row;
-                row = new_row;
-                break;
-            } else {
-                row = row->next;
-                _out_flags |= SW_TABLE_FLAG_CONFLICT;
-                _conflict_level++;
-            }
+void Table::apply_values(TableRow *row, const TableValues &values) {
+    for (const auto &value : values) {
+        if (value.column->type == TableColumn::TYPE_STRING) {
+            row->set_value(value.column, value.data.data(), value.data.size());
+        } else {
+            memcpy(row->data + value.column->index, value.data.data(), value.column->size);
         }
+    }
+}
+
+bool Table::match_values(const TableRow *row, const TableValues &expected) {
+    for (const auto &value : expected) {
+        if (value.column->type == TableColumn::TYPE_STRING) {
+            TableStringLength length;
+            memcpy(&length, row->data + value.column->index, sizeof(length));
+            if (length != value.data.size() ||
+                (length != 0 &&
+                 memcmp(row->data + value.column->index + sizeof(length), value.data.data(), length) != 0)) {
+                return false;
+            }
+        } else if (memcmp(row->data + value.column->index, value.data.data(), value.column->size) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Table::delete_row(TableRow *root, TableRow *row, TableRow *previous) {
+    if (row->next == nullptr && row == root) {
+        row->clear();
+    } else if (row == root) {
+        // When deleting the root, move the first conflict row into it before releasing that conflict slice.
+        TableRow *next = row->next;
+        row->next = next->next;
+        memcpy(row->key, next->key, next->key_len + 1);
+        row->key_len = next->key_len;
+        memcpy(row->data, next->data, item_size);
+        free_row(next);
     } else {
-        init_row(row, key, keylen);
-        _out_flags |= SW_TABLE_FLAG_NEW_ROW;
+        previous->next = row->next;
+        free_row(row);
+    }
+
+    sw_atomic_fetch_add(&(delete_count), 1);
+    sw_atomic_fetch_sub(&(row_num), 1);
+}
+
+TableRow *Table::get(const char *key, size_t keylen, TableRow **rowlock) const {
+    // The caller owns the returned bucket lock and must pass a non-null rowlock to release it.
+    if (sw_unlikely(rowlock == nullptr)) {
+        return nullptr;
+    }
+    *rowlock = nullptr;
+    if (!is_valid_key_length(keylen)) {
+        return nullptr;
+    }
+
+    TableRow *root = hash(key, keylen);
+    *rowlock = root;
+    root->lock();
+
+    TableRow *previous = nullptr;
+    return find_row(root, key, keylen, &previous);
+}
+
+TableRow *Table::set(const char *key, size_t keylen, TableRow **rowlock, int *out_flags) {
+    // The caller owns the returned bucket lock and must pass a non-null rowlock to release it.
+    if (sw_unlikely(rowlock == nullptr)) {
+        return nullptr;
+    }
+    *rowlock = nullptr;
+    if (out_flags) {
+        *out_flags = 0;
+    }
+    if (!is_valid_key_length(keylen)) {
+        return nullptr;
+    }
+
+    TableRow *root = hash(key, keylen);
+    *rowlock = root;
+    root->lock();
+
+    TableRow *previous = nullptr;
+    uint32_t conflict_level = 0;
+    TableRow *row = find_row(root, key, keylen, &previous, &conflict_level);
+    int flags = 0;
+
+    if (row == nullptr) {
+        if (root->active) {
+            conflict_count++;
+            if (conflict_level > conflict_max_level) {
+                conflict_max_level = conflict_level;
+            }
+            row = alloc_row();
+            if (row == nullptr) {
+                return nullptr;
+            }
+            init_row(row, key, keylen);
+            previous->next = row;
+            if (conflict_level > 1) {
+                flags |= SW_TABLE_FLAG_CONFLICT;
+            }
+        } else {
+            row = root;
+            init_row(row, key, keylen);
+        }
+        flags |= SW_TABLE_FLAG_NEW_ROW;
+    } else if (previous != nullptr) {
+        flags |= SW_TABLE_FLAG_CONFLICT;
     }
 
     if (out_flags) {
-        *out_flags = _out_flags;
+        *out_flags = flags;
     }
 
-    if (_out_flags & SW_TABLE_FLAG_NEW_ROW) {
+    if (flags & SW_TABLE_FLAG_NEW_ROW) {
         sw_atomic_fetch_add(&(insert_count), 1);
     } else {
         sw_atomic_fetch_add(&(update_count), 1);
@@ -381,59 +538,182 @@ TableRow *Table::set(const char *key, uint16_t keylen, TableRow **rowlock, int *
     return row;
 }
 
-bool Table::del(const char *key, uint16_t keylen) {
-    check_key_length(&keylen);
-
-    TableRow *row = hash(key, keylen);
-    // no exists
-    if (!row->active) {
+bool Table::set(const char *key, size_t keylen, const TableValues &values, bool *out_of_space) {
+    if (out_of_space) {
+        *out_of_space = false;
+    }
+    if (!is_valid_key_length(keylen)) {
         return false;
     }
 
-    TableRow *tmp, *prev = nullptr;
-
-    row->lock();
-    if (row->next == nullptr) {
-        if (sw_mem_equal(row->key, row->key_len, key, keylen)) {
-            row->clear();
-        } else {
-            goto _not_exists;
-        }
-    } else {
-        tmp = row;
-        while (tmp) {
-            if (sw_mem_equal(tmp->key, tmp->key_len, key, keylen)) {
-                break;
+    TableRow *rowlock = nullptr;
+    int out_flags = 0;
+    TableRow *row = set(key, keylen, &rowlock, &out_flags);
+    if (row == nullptr) {
+        if (rowlock) {
+            rowlock->unlock();
+            if (out_of_space) {
+                *out_of_space = true;
             }
-            prev = tmp;
-            tmp = tmp->next;
         }
-
-        if (tmp == nullptr) {
-        _not_exists:
-            row->unlock();
-
-            return false;
-        }
-
-        // when the deleting element is root, should move the first element's data to root,
-        // and remove the element from the collision list.
-        if (tmp == row) {
-            tmp = tmp->next;
-            row->next = tmp->next;
-            memcpy(row->key, tmp->key, tmp->key_len + 1);
-            row->key_len = tmp->key_len;
-            memcpy(row->data, tmp->data, item_size);
-        } else {
-            prev->next = tmp->next;
-        }
-        free_row(tmp);
+        return false;
     }
 
-    sw_atomic_fetch_add(&(delete_count), 1);
-    sw_atomic_fetch_sub(&(row_num), 1);
-    row->unlock();
+    if (out_flags & SW_TABLE_FLAG_NEW_ROW) {
+        clear_row(row);
+    }
+    apply_values(row, values);
+    rowlock->unlock();
+    return true;
+}
 
+bool Table::add(const char *key, size_t keylen, const TableValues &values, bool *out_of_space) {
+    if (out_of_space) {
+        *out_of_space = false;
+    }
+    if (!is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+
+    TableRow *previous = nullptr;
+    uint32_t conflict_level = 0;
+    if (find_row(root, key, keylen, &previous, &conflict_level) != nullptr) {
+        root->unlock();
+        return false;
+    }
+
+    TableRow *row = root;
+    if (root->active) {
+        row = alloc_row();
+        if (row == nullptr) {
+            if (out_of_space) {
+                *out_of_space = true;
+            }
+            root->unlock();
+            return false;
+        }
+        init_row(row, key, keylen);
+        previous->next = row;
+        conflict_count++;
+        if (conflict_level > conflict_max_level) {
+            conflict_max_level = conflict_level;
+        }
+    } else {
+        init_row(row, key, keylen);
+    }
+
+    clear_row(row);
+    apply_values(row, values);
+    sw_atomic_fetch_add(&(insert_count), 1);
+    root->unlock();
+    return true;
+}
+
+bool Table::update(const char *key, size_t keylen, const TableValues &values) {
+    if (!is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+    TableRow *previous = nullptr;
+    TableRow *row = find_row(root, key, keylen, &previous);
+    if (row == nullptr) {
+        root->unlock();
+        return false;
+    }
+
+    apply_values(row, values);
+    sw_atomic_fetch_add(&(update_count), 1);
+    root->unlock();
+    return true;
+}
+
+bool Table::cmpset(const char *key, size_t keylen, const TableValues &expected, const TableValues &values) {
+    if (!is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+    TableRow *previous = nullptr;
+    TableRow *row = find_row(root, key, keylen, &previous);
+    if (row == nullptr || !match_values(row, expected)) {
+        root->unlock();
+        return false;
+    }
+
+    apply_values(row, values);
+    sw_atomic_fetch_add(&(update_count), 1);
+    root->unlock();
+    return true;
+}
+
+bool Table::cmpdel(const char *key, size_t keylen, const TableValues &expected) {
+    if (!is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+    TableRow *previous = nullptr;
+    TableRow *row = find_row(root, key, keylen, &previous);
+    if (row == nullptr || !match_values(row, expected)) {
+        root->unlock();
+        return false;
+    }
+
+    delete_row(root, row, previous);
+    root->unlock();
+    return true;
+}
+
+bool Table::getdel(const char *key, size_t keylen, const TableColumn *column, std::string *data) {
+    if (data == nullptr || !is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    const size_t snapshot_size = column == nullptr ? item_size : column->size;
+    data->resize(snapshot_size);
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+    TableRow *previous = nullptr;
+    TableRow *row = find_row(root, key, keylen, &previous);
+    if (row == nullptr) {
+        root->unlock();
+        data->clear();
+        return false;
+    }
+
+    if (snapshot_size != 0) {
+        const char *source = row->data + (column == nullptr ? 0 : column->index);
+        memcpy(&(*data)[0], source, snapshot_size);
+    }
+    delete_row(root, row, previous);
+    root->unlock();
+    return true;
+}
+
+bool Table::del(const char *key, size_t keylen) {
+    if (!is_valid_key_length(keylen)) {
+        return false;
+    }
+
+    TableRow *root = hash(key, keylen);
+    root->lock();
+    TableRow *previous = nullptr;
+    TableRow *row = find_row(root, key, keylen, &previous);
+    if (row == nullptr) {
+        root->unlock();
+        return false;
+    }
+
+    delete_row(root, row, previous);
+    root->unlock();
     return true;
 }
 

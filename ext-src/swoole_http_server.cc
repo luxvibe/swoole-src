@@ -48,6 +48,13 @@ static bool http_context_send_data(HttpContext *ctx, const char *data, size_t le
 static bool http_context_sendfile(HttpContext *ctx, zend_string *file, off_t offset, size_t length);
 static bool http_context_disconnect(HttpContext *ctx);
 
+static void http_context_discard(HttpContext *ctx) {
+    ctx->end_ = 1;
+    ctx->onAfterResponse = nullptr;
+    zval_ptr_dtor(ctx->request.zobject);
+    zval_ptr_dtor(ctx->response.zobject);
+}
+
 static void http_server_process_request(const Server *serv, zend::Callable *cb, HttpContext *ctx) {
     zval args[2];
     args[0] = *ctx->request.zobject;
@@ -111,11 +118,11 @@ int php_swoole_http_server_onReceive(Server *serv, RecvData *req) {
         ctx->send(ctx, SW_STRL(SW_HTTP_BAD_REQUEST_PACKET));
         ctx->close(ctx);
         if (ctx->parser.error != HPE_OK) {
-            swoole_notice("Invalid HTTP request discarded: %ld bytes unprocessed. Reason: %s",
+            swoole_warning("Invalid HTTP request discarded: %ld bytes unprocessed. Reason: %s",
                           Z_STRLEN_P(zdata) - parsed_n,
                           llhttp_get_error_reason(&ctx->parser));
         } else {
-            swoole_notice("Incomplete HTTP request: parsed successfully but missing required components");
+            swoole_warning("Incomplete HTTP request: parsed successfully but missing required components");
         }
         goto _dtor_and_return;
     }
@@ -192,15 +199,14 @@ void php_swoole_http_server_rshutdown() {
         SG(rfc1867_uploaded_files) = nullptr;
     }
 
+    // A fatal bailout can leave HTTP/2 sessions here; free them before Zend tears down the allocator nghttp2 uses.
+    swoole_http2_server_release_sessions();
     server_ips.clear();
     client_ips.clear();
     while (!queued_http_contexts.empty()) {
         HttpContext *ctx = queued_http_contexts.front();
         queued_http_contexts.pop();
-        ctx->end_ = 1;
-        ctx->onAfterResponse = nullptr;
-        zval_ptr_dtor(ctx->request.zobject);
-        zval_ptr_dtor(ctx->response.zobject);
+        http_context_discard(ctx);
     }
 }
 #endif
@@ -323,6 +329,15 @@ void HttpContext::free() {
         multipart_parser_free(mt_parser);
         mt_parser = nullptr;
     }
+    if (current_form_data_name) {
+        efree(current_form_data_name);
+        current_form_data_name = nullptr;
+        current_form_data_name_len = 0;
+    }
+    if (current_multipart_header) {
+        sw_zval_free(current_multipart_header);
+        current_multipart_header = nullptr;
+    }
     if (form_data_buffer) {
         delete form_data_buffer;
         form_data_buffer = nullptr;
@@ -363,6 +378,7 @@ bool swoole_http_server_onBeforeRequest(HttpContext *ctx) {
     ctx->onBeforeRequest = nullptr;
     ctx->onAfterResponse = swoole_http_server_onAfterResponse;
     if (!sw_server() || !sw_worker() || sw_worker()->is_shutdown()) {
+        http_context_discard(ctx);
         return false;
     }
 
@@ -397,6 +413,7 @@ void swoole_http_server_onAfterResponse(HttpContext *ctx) {
             queued_http_contexts.pop();
             _ctx->send(_ctx, SW_STRL(SW_HTTP_SERVICE_UNAVAILABLE_PACKET));
             _ctx->close(_ctx);
+            http_context_discard(_ctx);
         }
         return;
     }

@@ -36,6 +36,7 @@ static inline swReturnCode catch_system_error(int error) {
     case SW_SUCCESS:
     case EAGAIN:
     case EINTR:
+    case ETIMEDOUT:
         return SW_CONTINUE;
     default:
         return SW_ERROR;
@@ -134,14 +135,14 @@ int ProcessPool::create_message_bus() {
         swoole_error_log(SW_LOG_WARNING, SW_ERROR_WRONG_OPERATION, "the message bus has been created");
         return SW_ERR;
     }
-    auto *msg_id = static_cast<sw_atomic_long_t *>(sw_mem_pool()->alloc(sizeof(sw_atomic_long_t)));
-    if (msg_id == nullptr) {
+    message_bus_msg_id = static_cast<sw_atomic_long_t *>(sw_mem_pool()->alloc(sizeof(sw_atomic_long_t)));
+    if (message_bus_msg_id == nullptr) {
         swoole_sys_warning("malloc[1] failed");
         return SW_ERR;
     }
-    *msg_id = 1;
+    *message_bus_msg_id = 1;
     message_bus = new MessageBus();
-    message_bus->set_id_generator([msg_id]() { return sw_atomic_fetch_add(msg_id, 1); });
+    message_bus->set_id_generator([this]() { return sw_atomic_fetch_add(message_bus_msg_id, 1); });
     size_t ipc_max_size;
 #ifndef __linux__
     ipc_max_size = SW_IPC_MAX_SIZE;
@@ -157,46 +158,49 @@ int ProcessPool::create_message_bus() {
 #endif
     message_bus->set_buffer_size(ipc_max_size);
     if (!message_bus->alloc_buffer()) {
+        delete message_bus;
+        message_bus = nullptr;
+        sw_mem_pool()->free((void *) message_bus_msg_id);
+        message_bus_msg_id = nullptr;
         return SW_ERR;
     }
+    return SW_OK;
+}
+
+static int ProcessPool_listen(
+    const ProcessPool *pool, SocketType socket_type, const char *address, int port, int backlog) {
+    if (pool->ipc_mode != SW_IPC_SOCKET) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_OPERATION_NOT_SUPPORT, "not support, ipc_mode must be SW_IPC_SOCKET");
+        return SW_ERR;
+    }
+    if (pool->stream_info_->socket) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_WRONG_OPERATION, "the process pool is already listening");
+        return SW_ERR;
+    }
+    char *_address = sw_strdup(address);
+    if (_address == nullptr) {
+        return SW_ERR;
+    }
+    auto _socket = make_server_socket(socket_type, address, port, backlog);
+    if (!_socket) {
+        sw_free(_address);
+        return SW_ERR;
+    }
+    pool->stream_info_->socket_address = _address;
+    pool->stream_info_->socket_port = port;
+    pool->stream_info_->socket = _socket;
     return SW_OK;
 }
 
 int ProcessPool::listen(const char *socket_file, int backlog) const {
-    if (ipc_mode != SW_IPC_SOCKET) {
-        swoole_error_log(SW_LOG_WARNING, SW_ERROR_OPERATION_NOT_SUPPORT, "not support, ipc_mode must be SW_IPC_SOCKET");
-        return SW_ERR;
-    }
-    stream_info_->socket_file = sw_strdup(socket_file);
-    if (stream_info_->socket_file == nullptr) {
-        return SW_ERR;
-    }
-    stream_info_->socket_port = 0;
-    stream_info_->socket = make_server_socket(SW_SOCK_UNIX_STREAM, stream_info_->socket_file, 0, backlog);
-    if (!stream_info_->socket) {
-        return SW_ERR;
-    }
-    return SW_OK;
+    return ProcessPool_listen(this, SW_SOCK_UNIX_STREAM, socket_file, 0, backlog);
 }
 
 int ProcessPool::listen(const char *host, int port, int backlog) const {
-    if (ipc_mode != SW_IPC_SOCKET) {
-        swoole_error_log(SW_LOG_WARNING, SW_ERROR_OPERATION_NOT_SUPPORT, "not support, ipc_mode must be SW_IPC_SOCKET");
-        return SW_ERR;
-    }
-    stream_info_->socket_file = sw_strdup(host);
-    if (stream_info_->socket_file == nullptr) {
-        return SW_ERR;
-    }
-    stream_info_->socket_port = port;
-    stream_info_->socket = make_server_socket(SW_SOCK_TCP, host, port, backlog);
-    if (!stream_info_->socket) {
-        return SW_ERR;
-    }
-    return SW_OK;
+    return ProcessPool_listen(this, SW_SOCK_TCP, host, port, backlog);
 }
 
-void ProcessPool::set_protocol(ProtocolType _protocol_type) {
+void ProcessPool::set_protocol(swProtocolType _protocol_type) {
     switch (_protocol_type) {
     case SW_PROTOCOL_TASK:
         main_loop = run_with_task_protocol;
@@ -297,6 +301,11 @@ int ProcessPool::response(const char *data, uint32_t length) const {
 }
 
 bool ProcessPool::send_message(WorkerId worker_id, const char *message, size_t l_message) const {
+    if (!is_worker_id_valid(worker_id)) {
+        swoole_set_last_error(SW_ERROR_INVALID_PARAMS);
+        return false;
+    }
+
     Worker *worker = get_worker(worker_id);
     if (message_bus) {
         SendData _task{};
@@ -322,12 +331,17 @@ int ProcessPool::push_message(uint8_t _type, const void *data, size_t length) co
     }
 
     EventData msg;
-    assert(length < sizeof(msg.data));
+    if (sw_unlikely((data == nullptr && length > 0) || length > sizeof(msg.data))) {
+        swoole_set_last_error(SW_ERROR_INVALID_PARAMS);
+        return SW_ERR;
+    }
 
     msg.info = {};
     msg.info.type = _type;
     msg.info.len = length;
-    memcpy(msg.data, data, length);
+    if (length > 0) {
+        memcpy(msg.data, data, length);
+    }
 
     return push_message(&msg);
 }
@@ -341,7 +355,7 @@ int ProcessPool::pop_message(void *data, size_t size) const {
 
 swResultCode ProcessPool::dispatch(EventData *data, int *dst_worker_id) {
     if (use_socket) {
-        Stream *stream = Stream::create(stream_info_->socket_file, 0, SW_SOCK_UNIX_STREAM);
+        Stream *stream = Stream::create(stream_info_->socket_address, 0, SW_SOCK_UNIX_STREAM);
         if (!stream) {
             return SW_ERR;
         }
@@ -376,7 +390,7 @@ swResultCode ProcessPool::dispatch_sync(const char *data, uint32_t len) const {
     if (!client.ready()) {
         return SW_ERR;
     }
-    if (client.connect(stream_info_->socket_file, stream_info_->socket_port, -1, 0) < 0) {
+    if (client.connect(stream_info_->socket_address, stream_info_->socket_port, -1, 0) < 0) {
         return SW_ERR;
     }
     uint32_t packed_len = htonl(len);
@@ -457,8 +471,12 @@ void ProcessPool::reopen_logger() {
 }
 
 void ProcessPool::kill_all_workers(int signo) {
+    // reopen_logger() can run from a signal handler before start() has spawned every worker.
+    // Unspawned slots still hold pid 0, and kill(0, ...) would signal the whole process group.
     SW_LOOP_N(worker_num) {
-        swoole_kill(workers[i].pid, signo);
+        if (workers[i].pid > 0) {
+            swoole_kill(workers[i].pid, signo);
+        }
     }
 }
 
@@ -620,8 +638,12 @@ int ProcessPool::run_with_task_protocol(ProcessPool *pool, Worker *worker) {
 int ProcessPool::recv_packet(Reactor *reactor, Event *event) {
     auto *pool = static_cast<ProcessPool *>(reactor->ptr);
     ssize_t n = event->socket->read(pool->packet_buffer, pool->max_packet_size_);
-    if (n < 0 && errno != EINTR) {
-        swoole_sys_warning("failed to read(%d) pipe", event->fd);
+    if (sw_unlikely(n < 0)) {
+        if (errno != EINTR && errno != EAGAIN) {
+            swoole_sys_warning("failed to read(%d) pipe", event->fd);
+            return SW_ERR;
+        }
+        return SW_OK;
     }
     RecvData msg{};
     msg.info.reactor_id = -1;
@@ -1001,7 +1023,6 @@ int ProcessPool::wait() {
         if (swoole_waitpid(worker->pid, &status, 0) < 0) {
             swoole_sys_warning("waitpid(%d) failed", worker->pid);
         }
-        break;
     }
     started = false;
 
@@ -1020,9 +1041,12 @@ void ProcessPool::destroy() {
     }
 
     if (stream_info_) {
-        if (stream_info_->socket) {
-            unlink(stream_info_->socket_file);
-            sw_free(stream_info_->socket_file);
+        if (stream_info_->socket && stream_info_->socket->socket_type == SW_SOCK_UNIX_STREAM) {
+            unlink(stream_info_->socket_address);
+        }
+        if (stream_info_->socket_address) {
+            sw_free(stream_info_->socket_address);
+            stream_info_->socket_address = nullptr;
         }
         if (stream_info_->socket) {
             stream_info_->socket->free();
@@ -1051,6 +1075,10 @@ void ProcessPool::destroy() {
     if (message_bus) {
         delete message_bus;
         message_bus = nullptr;
+    }
+    if (message_bus_msg_id) {
+        sw_mem_pool()->free((void *) message_bus_msg_id);
+        message_bus_msg_id = nullptr;
     }
 
     sw_mem_pool()->free(workers);
@@ -1131,6 +1159,10 @@ void Worker::report_error(const ExitStatus &exit_status) const {
 
 void ReloadTask::add_workers(Worker *list, size_t n) {
     SW_LOOP_N(n) {
+        if (list[i].pid <= 0) {
+            swoole_warning("skip invalid worker(pid=%d, id=%d) for reload", list[i].pid, list[i].id);
+            continue;
+        }
         workers[list[i].pid] = &list[i];
         kill_queue.push(list[i].pid);
     }
@@ -1161,15 +1193,17 @@ ReloadTask::~ReloadTask() {
 }
 
 void ReloadTask::kill_all(int signal_number) {
-    for (auto &kv : workers) {
-        if (swoole_kill(kv.first, signal_number) < 0) {
+    for (auto iter = workers.begin(); iter != workers.end();) {
+        if (swoole_kill(iter->first, signal_number) < 0) {
             if (errno == ECHILD || errno == ESRCH) {
+                iter = workers.erase(iter);
                 continue;
             }
-            swoole_sys_warning("failed to kill(%d, SIGTERM) worker#[%d]", kv.first, kv.second->id);
+            swoole_sys_warning("failed to kill(%d, %d) worker#[%d]", iter->first, signal_number, iter->second->id);
         } else if (signal_number == SIGKILL) {
-            swoole_warning("force kill worker process(pid=%d, id=%d)", kv.first, kv.second->id);
+            swoole_warning("force kill worker process(pid=%d, id=%d)", iter->first, iter->second->id);
         }
+        iter++;
     }
 
     clear_queue();
@@ -1188,7 +1222,7 @@ void ReloadTask::kill_one(int signal_number) {
                 workers.erase(iter);
                 continue;
             }
-            swoole_sys_warning("kill(%d, SIGTERM) [%d] failed", pid, iter->second->id);
+            swoole_sys_warning("kill(%d, %d) [%d] failed", pid, signal_number, iter->second->id);
         }
         break;
     }

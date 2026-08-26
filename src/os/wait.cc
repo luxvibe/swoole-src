@@ -24,8 +24,12 @@
 #include <list>
 #include <unordered_map>
 
-using namespace swoole;
+using swoole::Coroutine;
+using swoole::Reactor;
 using swoole::coroutine::System;
+#if SW_USE_IOURING
+using swoole::Iouring;
+#endif
 
 struct WaitTask {
     Coroutine *co;
@@ -55,8 +59,9 @@ static void signal_handler(int signo) {
         }
 
         WaitTask *task = nullptr;
-        if (waitpid_map.find(exit_status.get_pid()) != waitpid_map.end()) {
-            task = waitpid_map[exit_status.get_pid()];
+        auto iter = waitpid_map.find(exit_status.get_pid());
+        if (iter != waitpid_map.end()) {
+            task = iter->second;
         } else if (!wait_list.empty()) {
             task = wait_list.front();
         } else {

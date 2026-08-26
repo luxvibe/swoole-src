@@ -175,11 +175,13 @@ static constexpr zend_function_entry swoole_runtime_methods[] = {
 static php_stream_wrapper ori_php_plain_files_wrapper;
 static php_stream_ops ori_php_stream_stdio_ops;
 
+struct PhpFunc;
 static void hook_func(const char *name,
                       size_t l_name,
                       zif_handler handler = nullptr,
                       zend_internal_arg_info *arg_info = nullptr);
 static void unhook_func(const char *name, size_t l_name);
+static void init_php_func_cache(PhpFunc *rf, zend_string *fn_str);
 
 static bool extension_loaded(const char *name) {
     zend_string *extension_name = zend_string_init(name, strlen(name), false);
@@ -208,15 +210,11 @@ static zend_internal_arg_info *get_arginfo(const char *name, size_t l_name) {
 }
 
 static zend_internal_arg_info *copy_arginfo(const zend_internal_function *function, zend_internal_arg_info *_arg_info) {
-    uint32_t num_args = function->num_args + 1;
+    uint32_t num_args = function->num_args + 1 + ((function->fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
     zend_internal_arg_info *arg_info = _arg_info - 1;
 
     auto new_arg_info = static_cast<zend_internal_arg_info *>(pemalloc(sizeof(zend_internal_arg_info) * num_args, 1));
     memcpy(new_arg_info, arg_info, sizeof(zend_internal_arg_info) * num_args);
-
-    if (function->fn_flags & ZEND_ACC_VARIADIC) {
-        num_args++;
-    }
 
     for (uint32_t i = 0; i < num_args; i++) {
         if (ZEND_TYPE_HAS_LIST(arg_info[i].type)) {
@@ -225,24 +223,18 @@ static zend_internal_arg_info *copy_arginfo(const zend_internal_function *functi
             memcpy(new_list, old_list, ZEND_TYPE_LIST_SIZE(old_list->num_types));
             ZEND_TYPE_SET_PTR(new_arg_info[i].type, new_list);
 
+            zend_type *list_type;
 #if PHP_VERSION_ID >= 80500
-            // For PHP 8.5+, ZEND_TYPE_LIST_FOREACH gives a const pointer, which we can't modify.
-            // We must use a manual loop over the list we allocated ourselves.
-            for (uint32_t j = 0; j < new_list->num_types; j++) {
-                zend_type *list_type = &new_list->types[j];
+            ZEND_TYPE_LIST_FOREACH_MUTABLE(new_list, list_type) {
+#else
+            ZEND_TYPE_LIST_FOREACH(new_list, list_type) {
+#endif
                 if (ZEND_TYPE_HAS_NAME(*list_type)) {
-                    zend_string *name = zend_string_dup(ZEND_TYPE_NAME(*list_type), 1);
+                    zend_string *name = zend_string_dup(ZEND_TYPE_NAME(*list_type), true);
                     ZEND_TYPE_SET_PTR(*list_type, name);
                 }
             }
-#else
-            zend_type *list_type;
-            ZEND_TYPE_LIST_FOREACH(new_list, list_type) {
-                zend_string *name = zend_string_dup(ZEND_TYPE_NAME(*list_type), true);
-                ZEND_TYPE_SET_PTR(*list_type, name);
-            }
             ZEND_TYPE_LIST_FOREACH_END();
-#endif
         } else if (ZEND_TYPE_HAS_NAME(arg_info[i].type)) {
             zend_string *name = zend_string_dup(ZEND_TYPE_NAME(arg_info[i].type), true);
             ZEND_TYPE_SET_PTR(new_arg_info[i].type, name);
@@ -497,6 +489,10 @@ static php_stream_size_t socket_write(php_stream *stream, const char *buf, size_
     }
     sock = abstract->socket;
 
+    if (sw_unlikely(EG(active) == 0)) {
+        return sock->get_socket()->send_sync(buf, count, 0);
+    }
+
     if (abstract->blocking) {
         didwrite = sock->send_all(buf, count);
     } else {
@@ -504,29 +500,32 @@ static php_stream_size_t socket_write(php_stream *stream, const char *buf, size_
         sock->set_err(errno);
     }
 
-    if (didwrite < 0 || (size_t) didwrite != count) {
-        /* we do not expect the outer layer to continue to call the `send` syscall in a loop
-         * and `didwrite` is meaningless if it failed */
-        didwrite = -1;
-        abstract->stream.timeout_event = (sock->errCode == ETIMEDOUT);
-        php_error_docref(nullptr,
-                         E_NOTICE,
-                         "Send of " ZEND_LONG_FMT " bytes failed with errno=%d %s",
-                         (zend_long) count,
-                         sock->errCode,
-                         sock->errMsg);
-    } else {
-        php_stream_notify_progress_increment(PHP_STREAM_CONTEXT(stream), didwrite, 0);
-    }
-
+    // Preserve positive partial counts so PHP can retry the unwritten remainder.
     if (didwrite < 0) {
-        if (sock->errCode == ETIMEDOUT || sock->get_socket()->catch_write_error(sock->errCode) == SW_WAIT) {
+        abstract->stream.timeout_event = (sock->errCode == ETIMEDOUT);
+
+        if (sock->errCode != ETIMEDOUT && sock->get_socket()->catch_write_error(sock->errCode) == SW_WAIT) {
             didwrite = 0;
         } else {
+            php_error_docref(nullptr,
+                             E_NOTICE,
+                             "Send of " ZEND_LONG_FMT " bytes failed with errno=%d %s",
+                             (zend_long) count,
+                             sock->errCode,
+                             sock->errMsg);
+
+            if (sock->errCode == ETIMEDOUT) {
+                didwrite = 0;
+            } else {
+                stream->eof = 1;
+            }
+        }
+    } else {
+        php_stream_notify_progress_increment(PHP_STREAM_CONTEXT(stream), didwrite, 0);
+
+        if (didwrite == 0) {
             stream->eof = 1;
         }
-    } else if (didwrite == 0) {
-        stream->eof = 1;
     }
 
 _exit:
@@ -542,6 +541,10 @@ static php_stream_size_t socket_read(php_stream *stream, char *buf, size_t count
         goto _exit;
     }
     sock = abstract->socket;
+
+    if (sw_unlikely(EG(active) == 0)) {
+        return sock->get_socket()->recv_sync(buf, count, 0);
+    }
 
     if (abstract->blocking) {
         nr_bytes = sock->recv(buf, count);
@@ -755,8 +758,6 @@ static inline int socket_accept(php_stream *stream, SocketImpl *sock, php_stream
     int *error_code = &xparam->outputs.error_code;
 
     int error = 0;
-    php_sockaddr_storage sa;
-    socklen_t sl = sizeof(sa);
 
     if (timeout) {
         sock->set_timeout(timeout, SW_TIMEOUT_READ);
@@ -781,7 +782,9 @@ static inline int socket_accept(php_stream *stream, SocketImpl *sock, php_stream
         }
         return FAILURE;
     } else {
-        php_network_populate_name_from_sockaddr((sockaddr *) &sa, sl, textaddr, addr, addrlen);
+        if (textaddr || addr) {
+            php_network_get_peer_name(clisock->get_fd(), textaddr, addr, addrlen);
+        }
 #ifdef TCP_NODELAY
         if (tcp_nodelay) {
             clisock->get_socket()->set_tcp_nodelay(tcp_nodelay);
@@ -789,14 +792,18 @@ static inline int socket_accept(php_stream *stream, SocketImpl *sock, php_stream
 #endif
         auto abstract = new NetStream();
         abstract->socket = clisock;
+        abstract->stream.socket = (int) clisock->get_fd();
         abstract->blocking = true;
 
         xparam->outputs.client = php_stream_alloc_rel(stream->ops, abstract, nullptr, "r+");
-        if (xparam->outputs.client) {
-            xparam->outputs.client->ctx = stream->ctx;
-            if (stream->ctx) {
-                GC_ADDREF(stream->ctx);
-            }
+        if (xparam->outputs.client == nullptr) {
+            delete abstract;
+            return FAILURE;
+        }
+
+        xparam->outputs.client->ctx = stream->ctx;
+        if (stream->ctx) {
+            GC_ADDREF(stream->ctx);
         }
         return SUCCESS;
     }
@@ -1047,7 +1054,7 @@ static inline int socket_xport_api(php_stream *stream, SocketImpl *sock, php_str
         }
         break;
     case STREAM_XPORT_OP_SHUTDOWN:
-        xparam->outputs.returncode = sock->shutdown(shutdown_how[xparam->how]);
+        xparam->outputs.returncode = sock->shutdown(shutdown_how[xparam->how]) ? 0 : -1;
         break;
     default:
 #ifdef SW_DEBUG
@@ -1293,7 +1300,7 @@ static php_stream *socket_create(const char *proto,
     stream = php_stream_alloc_rel(&socket_ops, abstract, persistent_id, "r+");
     if (stream == nullptr) {
         delete abstract;
-        goto _failed;
+        return nullptr;
     }
 
     if (!socket_ssl_set_options(sock, context)) {
@@ -1920,6 +1927,10 @@ static PHP_FUNCTION(swoole_time_nanosleep) {
         zend_argument_value_error(2, "must be greater than or equal to 0");
         RETURN_THROWS();
     }
+    if (tv_nsec > 999999999) {
+        zend_value_error("Nanoseconds was not in the range 0 to 999 999 999 or seconds was negative");
+        RETURN_THROWS();
+    }
 
     double _time = (double) tv_sec + (double) tv_nsec / 1000000000.00;
     if (Coroutine::get_current()) {
@@ -2188,6 +2199,9 @@ static void hook_func(const char *name, size_t l_name, zif_handler handler, zend
         if (arg_info) {
             rf->function->internal_function.arg_info = arg_info;
         }
+        if (use_php_func) {
+            init_php_func_cache(rf, rf->function->common.function_name);
+        }
         return;
     }
 
@@ -2218,12 +2232,7 @@ static void hook_func(const char *name, size_t l_name, zif_handler handler, zend
     }
 
     if (use_php_func) {
-        char func[128];
-        memcpy(func, ZEND_STRL("swoole_"));
-        memcpy(func + 7, fn_str->val, fn_str->len);
-
-        ZVAL_STRINGL(&rf->name, func, fn_str->len + 7);
-        rf->fci_cache = sw_callable_create(&rf->name);
+        init_php_func_cache(rf, fn_str);
     }
 
     zend_hash_add_ptr(hook_function_table, fn_str, rf);
@@ -2376,18 +2385,26 @@ static PHP_FUNCTION(swoole_stream_socket_pair) {
         RETURN_FALSE;
     }
 
-    array_init(return_value);
-
     php_swoole_check_reactor();
 
     php_stream *s1 = php_swoole_create_stream_from_socket(pair[0], domain, type, protocol STREAMS_CC);
     php_stream *s2 = php_swoole_create_stream_from_socket(pair[1], domain, type, protocol STREAMS_CC);
+    if (s1 == nullptr || s2 == nullptr) {
+        if (s1) {
+            php_stream_close(s1);
+        }
+        if (s2) {
+            php_stream_close(s2);
+        }
+        RETURN_FALSE;
+    }
 
     /* set the __exposed flag.
      * php_stream_to_zval() does, add_next_index_resource() does not */
     php_stream_auto_cleanup(s1);
     php_stream_auto_cleanup(s2);
 
+    array_init(return_value);
     add_next_index_resource(return_value, s1->res);
     add_next_index_resource(return_value, s2->res);
 }
@@ -2415,6 +2432,17 @@ static PHP_FUNCTION(swoole_user_func_handler) {
     fci.named_params = nullptr;
     ZVAL_UNDEF(&fci.function_name);
     zend_call_function(&fci, rf->fci_cache->ptr());
+}
+
+static void init_php_func_cache(PhpFunc *rf, zend_string *fn_str) {
+    if (rf->fci_cache) {
+        return;
+    }
+
+    std::string func("swoole_");
+    func.append(ZSTR_VAL(fn_str), ZSTR_LEN(fn_str));
+    ZVAL_STRINGL(&rf->name, func.c_str(), func.length());
+    rf->fci_cache = sw_callable_create(&rf->name);
 }
 
 zend_class_entry *find_class_entry(const char *name, size_t length) {

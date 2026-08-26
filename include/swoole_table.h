@@ -29,11 +29,25 @@
 #define SW_TABLE_USE_PHP_HASH
 #define SW_TABLE_MAX_ROW_SIZE 0x80000000
 
+enum TableFlag {
+    SW_TABLE_FLAG_NEW_ROW = 1,
+    SW_TABLE_FLAG_CONFLICT = 1u << 1,
+};
+
 namespace swoole {
 typedef uint32_t TableStringLength;
 typedef uint64_t (*HashFunc)(const char *key, size_t len);
 
 struct TableColumn;
+
+struct TableValue {
+    const TableColumn *column;
+    std::string data;
+
+    TableValue(const TableColumn *_column, const void *value, size_t length);
+};
+
+using TableValues = std::vector<TableValue>;
 
 struct TableRow {
     sw_atomic_t lock_;
@@ -88,11 +102,6 @@ struct TableIterator {
     void unlock() const {
         mutex_->unlock();
     }
-};
-
-enum TableFlag {
-    SW_TABLE_FLAG_NEW_ROW = 1,
-    SW_TABLE_FLAG_CONFLICT = 1u << 1,
 };
 
 struct TableColumn {
@@ -155,10 +164,16 @@ class Table {
     bool create();
     bool add_column(const std::string &name, enum TableColumn::Type type, size_t size);
     TableColumn *get_column(const std::string &key) const;
-    TableRow *set(const char *key, uint16_t keylen, TableRow **rowlock, int *out_flags);
-    TableRow *get(const char *key, uint16_t keylen, TableRow **rowlock) const;
-    bool exists(const char *key, uint16_t keylen) const;
-    bool del(const char *key, uint16_t keylen);
+    TableRow *set(const char *key, size_t keylen, TableRow **rowlock, int *out_flags);
+    bool set(const char *key, size_t keylen, const TableValues &values, bool *out_of_space = nullptr);
+    TableRow *get(const char *key, size_t keylen, TableRow **rowlock) const;
+    bool add(const char *key, size_t keylen, const TableValues &values, bool *out_of_space = nullptr);
+    bool update(const char *key, size_t keylen, const TableValues &values);
+    bool cmpset(const char *key, size_t keylen, const TableValues &expected, const TableValues &values);
+    bool cmpdel(const char *key, size_t keylen, const TableValues &expected);
+    bool getdel(const char *key, size_t keylen, const TableColumn *column, std::string *data);
+    bool exists(const char *key, size_t keylen) const;
+    bool del(const char *key, size_t keylen);
     void forward() const;
     // release shared memory
     void destroy();
@@ -217,7 +232,7 @@ class Table {
     }
 
   private:
-    TableRow *hash(const char *key, int keylen) const {
+    TableRow *hash(const char *key, size_t keylen) const {
         uint64_t hashv = hash_func(key, keylen);
         uint64_t index = hashv & mask;
         assert(index < size);
@@ -238,18 +253,22 @@ class Table {
         unlock();
     }
 
-    static void check_key_length(uint16_t *keylen) {
-        if (*keylen >= SW_TABLE_KEY_SIZE) {
-            *keylen = SW_TABLE_KEY_SIZE - 1;
-        }
+    TableRow *find_row(
+        TableRow *root, const char *key, size_t keylen, TableRow **previous, uint32_t *conflict_level = nullptr) const;
+    void delete_row(TableRow *root, TableRow *row, TableRow *previous);
+    static void apply_values(TableRow *row, const TableValues &values);
+    static bool match_values(const TableRow *row, const TableValues &expected);
+
+    static bool is_valid_key_length(size_t keylen) {
+        return keylen > 0 && keylen < SW_TABLE_KEY_SIZE;
     }
 
-    void init_row(TableRow *new_row, const char *key, int keylen) {
+    void init_row(TableRow *new_row, const char *key, size_t keylen) {
         sw_memset_zero(reinterpret_cast<char *>(new_row) + offsetof(TableRow, active),
                        sizeof(TableRow) - offsetof(TableRow, active));
         memcpy(new_row->key, key, keylen);
         new_row->key[keylen] = '\0';
-        new_row->key_len = keylen;
+        new_row->key_len = static_cast<uint8_t>(keylen);
         new_row->active = 1;
         sw_atomic_fetch_add(&(row_num), 1);
     }

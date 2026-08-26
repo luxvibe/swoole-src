@@ -102,6 +102,10 @@ int php_swoole_redis_server_onReceive(Server *serv, RecvData *req) {
 
     zval zparams{};
     array_init(&zparams);
+    ON_SCOPE_EXIT {
+        zval_ptr_dtor(&zdata);
+        zval_ptr_dtor(&zparams);
+    };
 
     int state = Redis::STATE_RECEIVE_TOTAL_LINE;
     int add_param = 0;
@@ -175,6 +179,7 @@ int php_swoole_redis_server_onReceive(Server *serv, RecvData *req) {
     auto fci_cache = i->second;
     zval args[2];
     zval retval;
+    ZVAL_UNDEF(&retval);
 
     ZVAL_LONG(&args[0], fd);
     args[1] = zparams;
@@ -190,9 +195,9 @@ int php_swoole_redis_server_onReceive(Server *serv, RecvData *req) {
     if (Z_TYPE_P(&retval) == IS_STRING) {
         serv->send(fd, Z_STRVAL_P(&retval), Z_STRLEN_P(&retval));
     }
-    zval_ptr_dtor(&retval);
-    zval_ptr_dtor(&zdata);
-    zval_ptr_dtor(&zparams);
+    if (!Z_ISUNDEF(retval)) {
+        zval_ptr_dtor(&retval);
+    }
 
     return SW_OK;
 }
@@ -212,9 +217,9 @@ static PHP_METHOD(swoole_redis_server, setHandler) {
         RETURN_FALSE;
     }
 
-    auto fci_cache = sw_callable_create(zcallback);
-    if (!fci_cache) {
-        return;
+    auto callback = sw_callable_create(zcallback);
+    if (!callback) {
+        RETURN_FALSE;
     }
 
     char _command[SW_REDIS_MAX_COMMAND_SIZE];
@@ -233,7 +238,7 @@ static PHP_METHOD(swoole_redis_server, setHandler) {
         sw_callable_free(i->second);
     }
 
-    redis_handlers[key] = fci_cache;
+    redis_handlers[key] = callback;
 
     RETURN_TRUE;
 }

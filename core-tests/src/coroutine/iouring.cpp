@@ -23,6 +23,7 @@
 #ifdef SW_USE_IOURING
 using swoole::Iouring;
 using swoole::Reactor;
+using swoole::Coroutine;
 using swoole::coroutine::System;
 using swoole::test::coroutine;
 using swoole::test::create_socket_pair;
@@ -188,7 +189,6 @@ TEST(iouring, ftruncate) {
         Iouring::close(fd);
     });
 }
-#endif
 #endif
 
 TEST(iouring, connect) {
@@ -466,3 +466,4 @@ TEST(iouring, accept_timeout) {
         Iouring::close(server_sock);
     });
 }
+#endif

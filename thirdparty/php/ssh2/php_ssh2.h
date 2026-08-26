@@ -31,6 +31,7 @@
 #define PHP_SSH2_FINGERPRINT_SHA1 0x0001
 #define PHP_SSH2_FINGERPRINT_HEX 0x0000
 #define PHP_SSH2_FINGERPRINT_RAW 0x0002
+#define PHP_SSH2_FINGERPRINT_SHA256 0x0004
 
 #define PHP_SSH2_TERM_UNIT_CHARS 0x0000
 #define PHP_SSH2_TERM_UNIT_PIXELS 0x0001
@@ -100,6 +101,8 @@ typedef struct _php_ssh2_channel_data {
     unsigned int streamid;
     char is_blocking;
     long timeout;
+    bool timeout_event;
+    bool wait_for_remote_close;
 
     /* Resource */
     zend_resource *session_rsrc;
@@ -108,6 +111,21 @@ typedef struct _php_ssh2_channel_data {
     unsigned char *refcount;
 
 } php_ssh2_channel_data;
+
+static inline php_ssh2_channel_data *php_ssh2_channel_data_create(LIBSSH2_CHANNEL *channel,
+                                                                  zend_resource *session_rsrc,
+                                                                  bool wait_for_remote_close) {
+    php_ssh2_channel_data *data = (php_ssh2_channel_data *) emalloc(sizeof(php_ssh2_channel_data));
+    data->channel = channel;
+    data->streamid = 0;
+    data->is_blocking = 1;
+    data->timeout = 0;
+    data->timeout_event = false;
+    data->wait_for_remote_close = wait_for_remote_close;
+    data->session_rsrc = session_rsrc;
+    data->refcount = NULL;
+    return data;
+}
 
 LIBSSH2_SESSION *php_ssh2_session_connect(const char *host, int port, zval *methods, zval *callbacks);
 void php_ssh2_sftp_dtor(zend_resource *rsrc);
@@ -130,6 +148,10 @@ extern php_stream_wrapper php_ssh2_sftp_wrapper;
 /* Resource list entries */
 extern int le_ssh2_session;
 extern int le_ssh2_sftp;
+
+static inline bool php_ssh2_session_is_open(zend_resource *session_rsrc) {
+    return session_rsrc && session_rsrc->ptr != NULL;
+}
 
 static inline LIBSSH2_SESSION *ssh2_get_session(php_ssh2_channel_data *abstract) {
     return (LIBSSH2_SESSION *) zend_fetch_resource(abstract->session_rsrc, PHP_SSH2_SESSION_RES_NAME, le_ssh2_session);

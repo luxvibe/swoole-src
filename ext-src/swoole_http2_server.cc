@@ -23,10 +23,13 @@
 
 #include "main/php_variables.h"
 
-using namespace swoole;
-using std::string;
-using swoole::coroutine::System;
-using swoole::http2::get_default_setting;
+using swoole::Connection;
+using swoole::Coroutine;
+using swoole::File;
+using swoole::RecvData;
+using swoole::Server;
+using swoole::SessionId;
+using swoole::String;
 using swoole::http_server::StaticHandler;
 
 namespace Http2 = swoole::http2;
@@ -36,8 +39,6 @@ using Http2Stream = Http2::Stream;
 using Http2Session = Http2::Session;
 
 static SW_THREAD_LOCAL std::unordered_map<SessionId, std::shared_ptr<Http2Session>> http2_sessions;
-static SW_THREAD_LOCAL std::unordered_map<SessionId, zend::Variable> server_ips;
-static SW_THREAD_LOCAL std::unordered_map<SessionId, zend::Variable> client_ips;
 
 static bool http2_server_respond(HttpContext *ctx, const String *body);
 static bool http2_server_send_range_file(HttpContext *ctx, StaticHandler *handler);
@@ -229,7 +230,8 @@ static bool http2_server_is_static_file(Server *serv, HttpContext *ctx) {
 
         zval *zdate_if_modified_since = zend_hash_str_find(Z_ARR_P(zheader), ZEND_STRL("if-modified-since"));
         if (zdate_if_modified_since) {
-            string date_if_modified_since(Z_STRVAL_P(zdate_if_modified_since), Z_STRLEN_P(zdate_if_modified_since));
+            std::string date_if_modified_since(Z_STRVAL_P(zdate_if_modified_since),
+                                               Z_STRLEN_P(zdate_if_modified_since));
             if (!date_if_modified_since.empty() && handler.is_modified(date_if_modified_since)) {
                 ctx->response.status = SW_HTTP_NOT_MODIFIED;
                 return true;
@@ -293,7 +295,7 @@ static void http2_server_onRequest(const std::shared_ptr<Http2Session> &client,
         HashTable *ht = Z_ARR_P(zserver);
         swoole_http_server_populate_ip_and_port(serv, ht, conn, client->fd, ctx->keepalive);
         http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REQUEST_TIME), (zend_long) time(nullptr));
-        http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REQUEST_TIME_FLOAT), microtime());
+        http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REQUEST_TIME_FLOAT), swoole::microtime());
         http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_MASTER_TIME), (zend_long) conn->last_recv_time);
         http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_PROTOCOL), SW_ZSTR_KNOWN(SW_ZEND_STR_HTTP2));
     } while (false);
@@ -336,6 +338,7 @@ static ssize_t http2_server_build_header(HttpContext *ctx, uchar *buffer, const 
     headers.add(ZEND_STRL(":status"), intbuf[0], ret);
 
     uint32_t header_flags = 0x0;
+    std::vector<std::string> content_lengths;
 
     // headers
     if (ZVAL_IS_ARRAY(zheader)) {
@@ -346,7 +349,7 @@ static ssize_t http2_server_build_header(HttpContext *ctx, uchar *buffer, const 
 
         zend_string *content_type = nullptr;
         auto add_header =
-            [ctx, &content_type](
+            [ctx, &content_type, &content_lengths](
                 Http2::HeaderSet &headers, const char *key, size_t l_key, zval *value, uint32_t &header_flags) {
                 if (ZVAL_IS_NULL(value)) {
                     return;
@@ -359,7 +362,23 @@ static ssize_t http2_server_build_header(HttpContext *ctx, uchar *buffer, const 
                 if (SW_STRCASEEQ(key, l_key, "server")) {
                     header_flags |= HTTP_HEADER_SERVER;
                 } else if (SW_STRCASEEQ(key, l_key, "content-length")) {
-                    return;  // ignore
+                    header_flags |= HTTP_HEADER_CONTENT_LENGTH;
+                    // Defer the field until compression has actually succeeded. Accept-Encoding alone
+                    // is insufficient because compression may still be disabled by the representation
+                    // headers or skipped for a body below compression_min_length.
+                    if (str_value.len() > 0) {
+                        content_lengths.emplace_back(str_value.val(), str_value.len());
+                    }
+                    return;
+                } else if (SW_STRCASEEQ(key, l_key, "content-encoding")) {
+#ifdef SW_HAVE_COMPRESSION
+                    // The application owns the representation encoding; do not compress it again.
+                    ctx->accept_compression = 0;
+#endif
+                    // An empty value keeps the field explicit without emitting it, like other known headers.
+                    if (str_value.len() == 0) {
+                        return;
+                    }
                 } else if (SW_STRCASEEQ(key, l_key, "date")) {
                     header_flags |= HTTP_HEADER_DATE;
                 } else if (SW_STRCASEEQ(key, l_key, "content-type")) {
@@ -395,9 +414,11 @@ static ssize_t http2_server_build_header(HttpContext *ctx, uchar *buffer, const 
             std::string str_content_type = content_type ? std::string(ZSTR_VAL(content_type), ZSTR_LEN(content_type))
                                                         : std::string(ZEND_STRL(SW_HTTP_DEFAULT_CONTENT_TYPE));
             ctx->accept_compression = ctx->compression_types->find(str_content_type) != ctx->compression_types->end();
-            if (content_type) {
-                zend_string_release(content_type);
-            }
+        }
+        // Released unconditionally: an application content-encoding can clear accept_compression
+        // after content-type was captured, which would skip the refinement above.
+        if (content_type) {
+            zend_string_release(content_type);
         }
 #endif
     }
@@ -425,19 +446,41 @@ static ssize_t http2_server_build_header(HttpContext *ctx, uchar *buffer, const 
         SW_HASHTABLE_FOREACH_END();
     }
 
-    if (body) {
-        size_t content_length = body->length;
-        // content length
+    size_t content_length = body ? body->length : 0;
+    bool content_compressed = false;
 #ifdef SW_HAVE_COMPRESSION
-        if (ctx->compress(body->str, body->length)) {
-            content_length = ctx->zlib_buffer->length;
-            // content encoding
-            const char *content_encoding = ctx->get_content_encoding();
-            headers.add(ZEND_STRL("content-encoding"), (char *) content_encoding, strlen(content_encoding));
-        }
+    if (body && ctx->compress(body->str, body->length)) {
+        content_compressed = true;
+        content_length = ctx->zlib_buffer->length;
+        const char *content_encoding = ctx->get_content_encoding();
+        headers.add(ZEND_STRL("content-encoding"), (char *) content_encoding, strlen(content_encoding));
+    }
 #endif
+
+    if (content_compressed) {
+        if (header_flags & HTTP_HEADER_CONTENT_LENGTH) {
+            swoole_error_log(SW_LOG_WARNING,
+                             SW_ERROR_HTTP_CONFLICT_HEADER,
+                             "The client has set 'Accept-Encoding', 'Content-Length' will be ignored");
+        }
         ret = swoole_itoa(intbuf[1], content_length);
         headers.add(ZEND_STRL("content-length"), intbuf[1], ret);
+    } else if (header_flags & HTTP_HEADER_CONTENT_LENGTH) {
+        for (const auto &value : content_lengths) {
+            headers.add(ZEND_STRL("content-length"), value.c_str(), value.length());
+        }
+    } else if (body) {
+        // HTTP/2 keeps the method in the request_method server var, not in llhttp's parser.
+        zval *zrequest_method = zend_hash_str_find(Z_ARR_P(ctx->request.zserver), ZEND_STRL("request_method"));
+        bool is_head = zrequest_method && Z_TYPE_P(zrequest_method) == IS_STRING &&
+                       SW_STRCASEEQ(Z_STRVAL_P(zrequest_method), Z_STRLEN_P(zrequest_method), "HEAD");
+
+        // Synthesize a length only when the caller did not supply one, and never rewrite a
+        // zero-length HEAD representation to an explicit zero.
+        if (body->length > 0 || !is_head) {
+            ret = swoole_itoa(intbuf[1], content_length);
+            headers.add(ZEND_STRL("content-length"), intbuf[1], ret);
+        }
     }
 
     auto client = http2_sessions[ctx->fd];
@@ -636,14 +679,18 @@ bool Http2Stream::send_trailer() const {
 
     http_buffer->clear();
     ssize_t bytes = http2_server_build_trailer(ctx, (uchar *) header_buffer);
+    if (bytes < 0) {
+        return false;
+    }
+
+    http2::set_frame_header(
+        frame_header, SW_HTTP2_TYPE_HEADERS, bytes, SW_HTTP2_FLAG_END_HEADERS | SW_HTTP2_FLAG_END_STREAM, id);
+    http_buffer->append(frame_header, SW_HTTP2_FRAME_HEADER_SIZE);
     if (bytes > 0) {
-        http2::set_frame_header(
-            frame_header, SW_HTTP2_TYPE_HEADERS, bytes, SW_HTTP2_FLAG_END_HEADERS | SW_HTTP2_FLAG_END_STREAM, id);
-        http_buffer->append(frame_header, SW_HTTP2_FRAME_HEADER_SIZE);
         http_buffer->append(header_buffer, bytes);
-        if (!ctx->send(ctx, http_buffer->str, http_buffer->length)) {
-            return false;
-        }
+    }
+    if (!ctx->send(ctx, http_buffer->str, http_buffer->length)) {
+        return false;
     }
 
     return true;
@@ -714,11 +761,15 @@ static bool http2_server_respond(HttpContext *ctx, const String *body) {
 #endif
 
     SW_LOOP {
-        if (ctx->send_chunked && body->length == 0 && !stream->send_end_stream_data_frame()) {
-            break;
+        if (body->length == 0) {
+            // Trailer HEADERS carry END_STREAM, so only trailerless streamed responses need an empty DATA frame.
+            if (ctx->send_chunked && !ztrailer && !stream->send_end_stream_data_frame()) {
+                break;
+            }
         } else if (!stream->send_body(body, end_stream, client)) {
             break;
-        } else if (ztrailer && !stream->send_trailer()) {
+        }
+        if (ztrailer && !stream->send_trailer()) {
             break;
         }
         error = false;
@@ -857,24 +908,15 @@ static bool http2_server_send_range_file(HttpContext *ctx, StaticHandler *handle
 bool swoole_http2_server_send_file(HttpContext *ctx, zend_string *file, off_t offset, size_t length) {
     auto client = http2_sessions[ctx->fd];
     auto stream = client->get_stream(ctx->stream_id);
-    std::shared_ptr<String> body;
 
 #ifdef SW_HAVE_COMPRESSION
     ctx->accept_compression = 0;
 #endif
-    if (swoole_coroutine_is_in()) {
-        body = System::read_file(ZSTR_VAL(file), false);
-        if (!body) {
-            return false;
-        }
-    } else {
-        File fp(ZSTR_VAL(file), O_RDONLY);
-        if (!fp.ready()) {
-            return false;
-        }
-        body = fp.read_content();
+
+    File fp(ZSTR_VAL(file), O_RDONLY);
+    if (!fp.ready()) {
+        return false;
     }
-    body->length = SW_MIN(length, body->length);
 
     zval *ztrailer =
         sw_zend_read_property_ex(swoole_http_response_ce, ctx->response.zobject, SW_ZSTR_KNOWN(SW_ZEND_STR_TRAILER), 0);
@@ -889,7 +931,11 @@ bool swoole_http2_server_send_file(HttpContext *ctx, zend_string *file, off_t of
     }
 
     bool end_stream = (ztrailer == nullptr);
-    if (!stream->send_header(body.get(), end_stream)) {
+
+    // Compression is disabled above, so send_header() reads only the transfer length.
+    String content_length{};
+    content_length.length = length;
+    if (!stream->send_header(&content_length, end_stream)) {
         return false;
     }
 
@@ -897,10 +943,39 @@ bool swoole_http2_server_send_file(HttpContext *ctx, zend_string *file, off_t of
     ctx->end_ = 1;
 
     bool error = false;
+    String chunk(SW_FILE_CHUNK_SIZE);
+    off_t file_offset = offset;
+    size_t remaining = length;
 
-    if (body->length > 0) {
-        if (!stream->send_body(body.get(), end_stream, client, offset, length)) {
+    while (remaining > 0) {
+        const size_t read_size = SW_MIN(remaining, chunk.size);
+        ssize_t n_read = -1;
+        auto read_chunk = [&]() { n_read = fp.pread(chunk.str, read_size, file_offset); };
+
+        if (swoole_coroutine_is_in()) {
+            if (!swoole::coroutine::async(read_chunk)) {
+                error = true;
+                break;
+            }
+        } else {
+            read_chunk();
+        }
+
+        // A positive short read is progress; a zero-length read before the requested
+        // range ends is a premature end of file.
+        if (n_read <= 0) {
             error = true;
+            break;
+        }
+
+        chunk.length = n_read;
+        file_offset += n_read;
+        remaining -= n_read;
+
+        const bool last_data = remaining == 0 && !ztrailer;
+        if (!stream->send_body(&chunk, last_data, client)) {
+            error = true;
+            break;
         }
     }
 
@@ -955,6 +1030,9 @@ static int http2_server_parse_header(
     zval *zheader = ctx->request.zheader;
     zval *zserver = ctx->request.zserver;
 
+    uint32_t header_count = 0;
+    uint32_t max_headers = Http2::get_http2_max_headers();
+
     for (;;) {
         nghttp2_nv nv;
         int inflate_flags = 0;
@@ -971,6 +1049,17 @@ static int http2_server_parse_header(
         inlen -= proclen;
 
         if (inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
+            header_count++;
+            if (header_count > max_headers) {
+                swoole_error_log(SW_LOG_WARNING,
+                                 SW_ERROR_HTTP2_TOO_MANY_HEADERS,
+                                 "http2 stream#%d exceeded max_headers limit (%u)",
+                                 ctx->stream_id,
+                                 max_headers);
+                nghttp2_hd_inflate_end_headers(inflater);
+                return SW_ERR;
+            }
+
             swoole_trace_log(SW_TRACE_HTTP2,
                              "name=(%zu)[" SW_ECHO_BLUE "], value=(%zu)[" SW_ECHO_CYAN "]",
                              nv.namelen,
@@ -986,8 +1075,8 @@ static int http2_server_parse_header(
                     char *v_str = strchr((char *) nv.value, '?');
                     zend_string *zstr_path;
                     if (v_str) {
+                        int k_len = v_str - (char *) nv.value;
                         v_str++;
-                        int k_len = v_str - (char *) nv.value - 1;
                         int v_len = nv.valuelen - k_len - 1;
                         memcpy(pathbuf, nv.value, k_len);
                         pathbuf[k_len] = 0;
@@ -1035,10 +1124,10 @@ static int http2_server_parse_header(
                         nv.valuelen);
                     continue;
                 } else if (SW_STRCASEEQ((char *) nv.name, nv.namelen, "content-length")) {
-                    char *end;
-                    zend_long content_length = std::strtol((char *) nv.value, &end, 10);
-                    if (end != (char *) nv.value + nv.valuelen || content_length > client->max_body_size) {
+                    if (!Http2::parse_content_length((char *) nv.value, nv.valuelen, client->max_body_size, nullptr)) {
                         http2_server_send_status_code(ctx, SW_HTTP_REQUEST_ENTITY_TOO_LARGE);
+                        swoole_http2_server_goaway(ctx, SW_HTTP2_ERROR_NO_ERROR, nullptr);
+                        return SW_ERR;
                     }
                 }
 #ifdef SW_HAVE_COMPRESSION
@@ -1144,12 +1233,30 @@ int swoole_http2_server_parse(const std::shared_ptr<Http2Session> &client, const
     case SW_HTTP2_TYPE_HEADERS: {
         auto stream = client->get_stream(stream_id);
         swoole_http2_frame_trace_log("%s", (stream ? "exist stream" : "new stream"));
+
         if (!stream) {
+            if (sw_unlikely(client->streams.size() >= client->local_settings.max_concurrent_streams)) {
+                swoole_error_log(SW_LOG_WARNING,
+                                 SW_ERROR_HTTP2_TOO_MANY_STREAMS,
+                                 "http2 stream#%d refused, max_concurrent_streams limit (%u) reached",
+                                 stream_id,
+                                 client->local_settings.max_concurrent_streams);
+
+                char rst_frame[SW_HTTP2_FRAME_HEADER_SIZE + SW_HTTP2_RST_STREAM_SIZE];
+                uint32_t error_code = htonl(SW_HTTP2_ERROR_REFUSED_STREAM);
+                memcpy(rst_frame + SW_HTTP2_FRAME_HEADER_SIZE, &error_code, sizeof(error_code));
+
+                Http2::set_frame_header(rst_frame, SW_HTTP2_TYPE_RST_STREAM, SW_HTTP2_RST_STREAM_SIZE, 0, stream_id);
+                client->default_ctx->send(client->default_ctx, rst_frame, sizeof(rst_frame));
+                break;
+            }
+
             stream = client->create_stream(stream_id);
             if (!stream) {
                 return SW_ERR;
             }
         }
+
         HttpContext *ctx = stream->ctx;
         if (http2_server_parse_header(client, ctx, flags, buf, length) < 0) {
             return SW_ERR;
@@ -1291,7 +1398,6 @@ int swoole_http2_server_onReceive(Server *serv, Connection *conn, RecvData *req)
         client->default_ctx->onBeforeRequest = http2_server_onBeforeRequest;
         client->max_body_size = serv->get_package_max_length(conn);
         client->handle = http2_server_onRequest;
-        http2_sessions.emplace(session_id, client);
     } else {
         client = iter->second;
     }
@@ -1299,14 +1405,15 @@ int swoole_http2_server_onReceive(Server *serv, Connection *conn, RecvData *req)
     zval zdata;
     php_swoole_get_recv_data(serv, &zdata, req);
     int retval = swoole_http2_server_parse(client, Z_STRVAL(zdata));
-    zval_ptr_dtor(&zdata);
+    if (retval < 0) {
+        client->default_ctx->close(client->default_ctx);
+    }
 
-    return retval;
+    zval_ptr_dtor(&zdata);
+    return SW_OK;
 }
 
 void php_swoole_http2_server_onClose(Server *serv, SessionId session_id) {
-    server_ips.erase(session_id);
-    client_ips.erase(session_id);
     swoole_http2_server_session_free(session_id);
 }
 #endif
@@ -1322,7 +1429,15 @@ void swoole_http2_server_session_free(SessionId session_id) {
     if (iter == http2_sessions.end()) {
         return;
     }
-    /* default_ctx does not blong to session object */
-    iter->second->default_ctx = nullptr;
+    if (iter->second->is_coro) {
+        // A coroutine session borrows default_ctx from its request/response objects; an async session owns it.
+        iter->second->default_ctx = nullptr;
+    }
     http2_sessions.erase(iter);
+}
+
+void swoole_http2_server_release_sessions() {
+    while (!http2_sessions.empty()) {
+        swoole_http2_server_session_free(http2_sessions.begin()->first);
+    }
 }

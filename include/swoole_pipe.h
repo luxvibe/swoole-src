@@ -49,7 +49,7 @@ class SocketPair {
         blocking = _blocking;
         timeout = network::Socket::default_read_timeout;
     }
-    ~SocketPair();
+    virtual ~SocketPair();
 
     ssize_t read(void *_buf, size_t length) const;
     ssize_t write(const void *_buf, size_t length) const;
@@ -64,12 +64,14 @@ class SocketPair {
         return master_socket != nullptr && worker_socket != nullptr;
     }
 
+    // Contract: only call after ready() is true; constructors leave sockets null when OS setup fails.
     void set_timeout(double _timeout) {
         timeout = _timeout;
         master_socket->set_timeout(timeout);
         worker_socket->set_timeout(timeout);
     }
 
+    // Contract: only call after ready() is true; constructors leave sockets null when OS setup fails.
     void set_blocking(bool _blocking);
 };
 

@@ -39,6 +39,7 @@ bool UringSocket::connect(const sockaddr *addr, socklen_t addrlen) {
     int retval = Iouring::connect(socket->get_fd(), addr, addrlen, socket->connect_timeout);
     write_co = read_co = nullptr;
     if (retval < 0) {
+        set_err(errno);
         return false;
     }
 
@@ -76,13 +77,26 @@ UringSocket *UringSocket::accept(double timeout) {
     return client_sock;
 }
 
+bool UringSocket::cancel(EventType event) {
+    Coroutine *co = get_bound_co(event);
+    if (!co) {
+        return false;
+    }
+    if (event != SW_EVENT_READ && event != SW_EVENT_WRITE) {
+        set_err(EINVAL);
+        return false;
+    }
+    set_err(ECANCELED);
+    return co->cancel();
+}
+
 NetSocket *UringSocket::uring_accept(double timeout) {
     auto *client_socket = new NetSocket();
     int fd = Iouring::accept(socket->get_fd(),
                              reinterpret_cast<sockaddr *>(&client_socket->info.addr),
                              &client_socket->info.len,
                              SOCK_CLOEXEC | SOCK_NONBLOCK,
-                             socket->read_timeout);
+                             timeout);
     if (fd < 0) {
         delete client_socket;
         return nullptr;
@@ -289,7 +303,7 @@ bool UringSocket::poll(EventType _type, double timeout) {
     fds[0].fd = socket->get_fd();
     fds[0].revents = 0;
 
-    auto rc = Iouring::poll(fds, 1, timeout > 0 ? timeout * 1000 : timeout) == 1;
+    int rc = Iouring::poll(fds, 1, timeout > 0 ? timeout * 1000 : timeout);
     if (rc != 1) {
         set_err(rc == 0 ? ETIMEDOUT : errno);
         return false;
@@ -482,10 +496,8 @@ bool UringSocket::ssl_bio_perform(int rc, const char *fn) {
 
     int error = SSL_get_error(socket->ssl, rc);
     if (error == SSL_ERROR_WANT_WRITE) {
-        if (ssl_bio_write()) {
-        _error:
-            check_return_value(-1);
-            return false;
+        if (!ssl_bio_write()) {
+            goto _error;
         }
         return true;
     } else if (error == SSL_ERROR_WANT_READ) {
@@ -518,6 +530,9 @@ bool UringSocket::ssl_bio_perform(int rc, const char *fn) {
         }
         return false;
     }
+    _error:
+    check_return_value(-1);
+    return false;
 }
 
 bool UringSocket::ssl_handshake() {
